@@ -1,0 +1,6 @@
+github.com/eventsalsa/store v0.0.1 h1:m4WVkSezKluNTs7LT0fK8CKzitXAfvaFg4t6bxVA484=
+github.com/eventsalsa/store v0.0.1/go.mod h1:wX3xrX48VqqJrefjuQfnr65tGny+okl19tMoM6C2LB8=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/lib/pq v1.12.0 h1:mC1zeiNamwKBecjHarAr26c/+d8V5w/u4J0I/yASbJo=
+github.com/lib/pq v1.12.0/go.mod h1:/p+8NSbOcwzAEI7wiMXFlgydTwcgTr3OSKMsD2BitpA=
