@@ -48,6 +48,7 @@ The module intentionally favors simple, database-native coordination:
 
 ```text
 .
+├── cmd/migrate-gen/         # Stable CLI for generating worker infrastructure migrations
 ├── worker.go / config.go   # Worker orchestrator and configuration
 ├── dispatcher/             # PollDispatcher and NotifyDispatcher
 ├── postgres/               # PostgreSQL DAL for registration, leadership, assignment, checkpoints, gap-skip audit
@@ -78,7 +79,7 @@ The module is intended to be used alongside `github.com/eventsalsa/store` and it
 You need:
 
 - the event store tables from `github.com/eventsalsa/store`
-- the worker metadata tables from `github.com/eventsalsa/worker/migrations`
+- the worker metadata tables generated from `github.com/eventsalsa/worker/cmd/migrate-gen`
 
 ### 2. Build an event store
 
@@ -305,7 +306,26 @@ If a stale-gap decision later proves too aggressive for a consumer, the recovery
 
 ## Migration generation
 
-Use the `migrations` package to generate the worker infrastructure SQL.
+For the quickest path, use the stable `cmd/migrate-gen` entrypoint.
+
+```bash
+go run github.com/eventsalsa/worker/cmd/migrate-gen \
+  -output ./db/migrations \
+  -filename 002_worker_tables.sql
+```
+
+The CLI defaults match `migrations.DefaultConfig()`, and you can override table names to line up with `worker.With*Table(...)` options:
+
+```bash
+go run github.com/eventsalsa/worker/cmd/migrate-gen \
+  -output ./db/migrations \
+  -worker-nodes-table infra.worker_nodes \
+  -consumer-assignments-table infra.consumer_assignments \
+  -consumer-checkpoints-table infra.consumer_checkpoints \
+  -consumer-gap-skips-table infra.consumer_gap_skips
+```
+
+For more advanced integration, use the `migrations` package directly from your own program.
 
 ```go
 package main
@@ -317,17 +337,17 @@ import (
 )
 
 func main() {
-    config := &migrations.Config{
-        OutputFolder:             "./db/migrations",
-        OutputFilename:           "002_worker_tables.sql",
-        WorkerNodesTable:         "worker_nodes",
-        ConsumerAssignmentsTable: "consumer_assignments",
-        ConsumerCheckpointsTable: "consumer_checkpoints",
-    }
+	config := migrations.DefaultConfig()
+	config.OutputFolder = "./db/migrations"
+	config.OutputFilename = "002_worker_tables.sql"
+	config.WorkerNodesTable = "infra.worker_nodes"
+	config.ConsumerAssignmentsTable = "infra.consumer_assignments"
+	config.ConsumerCheckpointsTable = "infra.consumer_checkpoints"
+	config.ConsumerGapSkipsTable = "infra.consumer_gap_skips"
 
-    if err := migrations.GeneratePostgres(config); err != nil {
-        log.Fatal(err)
-    }
+	if err := migrations.GeneratePostgres(&config); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
