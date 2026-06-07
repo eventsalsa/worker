@@ -27,6 +27,9 @@ type Config struct {
 
 	// ConsumerGapSkipsTable is the name of the consumer gap skip audit table.
 	ConsumerGapSkipsTable string
+
+	// LeaderElectionTable is the name of the leader election lease table.
+	LeaderElectionTable string
 }
 
 // DefaultConfig returns the default configuration.
@@ -40,6 +43,7 @@ func DefaultConfig() Config {
 		ConsumerAssignmentsTable: "consumer_assignments",
 		ConsumerCheckpointsTable: "consumer_checkpoints",
 		ConsumerGapSkipsTable:    "consumer_gap_skips",
+		LeaderElectionTable:      "worker_leader_election",
 	}
 }
 
@@ -69,6 +73,7 @@ func generatePostgresSQL(config *Config) string {
 		normalized.ConsumerAssignmentsTable,
 		normalized.ConsumerCheckpointsTable,
 		normalized.ConsumerGapSkipsTable,
+		normalized.LeaderElectionTable,
 	)
 
 	return fmt.Sprintf(`-- Worker Infrastructure Migration
@@ -79,6 +84,7 @@ func generatePostgresSQL(config *Config) string {
 -- - %s maps consumers to worker nodes
 -- - %s stores each consumer's last processed global position
 -- - %s stores durable stale-gap advancement records
+-- - %s manages active leader leases
 %s
 CREATE TABLE IF NOT EXISTS %s (
     worker_id UUID PRIMARY KEY,
@@ -120,12 +126,21 @@ CREATE TABLE IF NOT EXISTS %s (
 
 CREATE INDEX IF NOT EXISTS idx_%s_consumer
     ON %s (consumer_name, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS %s (
+    lease_key TEXT PRIMARY KEY,
+    leader_id UUID NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 `,
 		time.Now().Format(time.RFC3339),
 		normalized.WorkerNodesTable,
 		normalized.ConsumerAssignmentsTable,
 		normalized.ConsumerCheckpointsTable,
 		normalized.ConsumerGapSkipsTable,
+		normalized.LeaderElectionTable,
 		schemaDDL,
 		normalized.WorkerNodesTable,
 		indexNameComponent(normalized.WorkerNodesTable), normalized.WorkerNodesTable,
@@ -135,6 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_consumer
 		normalized.ConsumerCheckpointsTable,
 		normalized.ConsumerGapSkipsTable,
 		indexNameComponent(normalized.ConsumerGapSkipsTable), normalized.ConsumerGapSkipsTable,
+		normalized.LeaderElectionTable,
 	)
 }
 
@@ -161,6 +177,9 @@ func normalizeConfig(config *Config) Config {
 	}
 	if config.ConsumerGapSkipsTable != "" {
 		normalized.ConsumerGapSkipsTable = config.ConsumerGapSkipsTable
+	}
+	if config.LeaderElectionTable != "" {
+		normalized.LeaderElectionTable = config.LeaderElectionTable
 	}
 
 	return normalized

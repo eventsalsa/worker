@@ -60,22 +60,23 @@ type workerStore interface {
 
 // Worker orchestrates distributed consumer execution for a single worker node.
 type Worker struct { //nolint:govet // fieldalignment: readability over marginal memory savings
-	config           Config
-	dispatcher       dispatcher.Dispatcher
-	store            workerStore
-	cancel           context.CancelFunc
-	processingCancel context.CancelFunc
-	fatalErrCh       chan error
-	runningConsumers map[string]context.CancelFunc
-	consumerDone     map[string]chan struct{}
-	db               *sql.DB
-	leaderConn       *sql.Conn
-	consumers        []consumer.Consumer
-	wg               sync.WaitGroup
-	mu               sync.Mutex
-	id               uuid.UUID
-	isLeader         bool
-	started          bool
+	config            Config
+	dispatcher        dispatcher.Dispatcher
+	store             workerStore
+	cancel            context.CancelFunc
+	processingCancel  context.CancelFunc
+	fatalErrCh        chan error
+	runningConsumers  map[string]context.CancelFunc
+	consumerDone      map[string]chan struct{}
+	db                *sql.DB
+	leaderConn        *sql.Conn
+	consumers         []consumer.Consumer
+	wg                sync.WaitGroup
+	mu                sync.Mutex
+	id                uuid.UUID
+	lastLeaderSuccess time.Time
+	isLeader          bool
+	started           bool
 }
 
 type processedBatch struct {
@@ -408,6 +409,10 @@ func (w *Worker) runLeaderLoop(ctx context.Context) {
 }
 
 func (w *Worker) leaderCycle(ctx context.Context) error {
+	if w.config.LeaderStrategy == LeaderStrategyLease {
+		return w.leaderCycleLease(ctx)
+	}
+
 	conn, err := w.ensureLeaderConn(ctx)
 	if err != nil {
 		return err
@@ -439,6 +444,57 @@ func (w *Worker) leaderCycle(ctx context.Context) error {
 
 	if err := w.rebalance(ctx, conn); err != nil {
 		return fmt.Errorf("rebalance after leader acquisition: %w", err)
+	}
+
+	return nil
+}
+
+func (w *Worker) leaderCycleLease(ctx context.Context) error {
+	now := timeNow()
+
+	w.mu.Lock()
+	lastSuccess := w.lastLeaderSuccess
+	isCurrentlyLeader := w.isLeader
+	w.mu.Unlock()
+
+	// Self-demotion check: if we are leader, verify we successfully renewed within HeartbeatTimeout.
+	if isCurrentlyLeader && !lastSuccess.IsZero() && now.Sub(lastSuccess) >= w.config.HeartbeatTimeout {
+		w.setLeader(false)
+		w.logger().Error(ctx, "leadership lease expired locally; relinquishing leadership", "worker_id", w.id, "last_success", lastSuccess, "elapsed", now.Sub(lastSuccess))
+		return nil
+	}
+
+	acquired, err := postgres.TryAcquireLease(ctx, w.db, w.config.LeaderElectionTable, w.id, w.config.HeartbeatTimeout)
+	if err != nil {
+		w.logger().Error(ctx, "failed to update leader lease in database", "worker_id", w.id, "error", err)
+		return nil
+	}
+
+	if !acquired {
+		if isCurrentlyLeader {
+			w.setLeader(false)
+			w.logger().Info(ctx, "worker lost leader lease; relinquishing leadership", "worker_id", w.id)
+		}
+		return nil
+	}
+
+	w.mu.Lock()
+	w.lastLeaderSuccess = now
+	w.mu.Unlock()
+
+	if !isCurrentlyLeader {
+		w.setLeader(true)
+		w.logger().Info(ctx, "worker became leader (lease acquired)", "worker_id", w.id)
+	}
+
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("get connection for lease rebalance: %w", err)
+	}
+	defer conn.Close()
+
+	if err := w.rebalance(ctx, conn); err != nil {
+		return fmt.Errorf("rebalance after leader lease acquisition: %w", err)
 	}
 
 	return nil
@@ -1194,6 +1250,16 @@ func (w *Worker) releaseLeaderConnection(ctx context.Context) error {
 	w.leaderConn = nil
 	w.isLeader = false
 	w.mu.Unlock()
+
+	if w.config.LeaderStrategy == LeaderStrategyLease {
+		if wasLeader {
+			if err := postgres.ReleaseLease(ctx, w.db, w.config.LeaderElectionTable, w.id); err != nil {
+				return fmt.Errorf("release leader lease: %w", err)
+			}
+			w.logger().Info(ctx, "worker released leadership (lease released)", "worker_id", w.id)
+		}
+		return nil
+	}
 
 	if conn == nil {
 		return nil

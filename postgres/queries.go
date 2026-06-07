@@ -19,6 +19,7 @@ const (
 	DefaultConsumerAssignmentsTable = "consumer_assignments"
 	DefaultConsumerCheckpointsTable = "consumer_checkpoints"
 	DefaultConsumerGapSkipsTable    = "consumer_gap_skips"
+	DefaultLeaderElectionTable      = "worker_leader_election"
 )
 
 func resolveTableName(tableName, defaultTableName string) string {

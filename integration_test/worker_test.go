@@ -773,3 +773,180 @@ func TestLeaderFailover_NewLeaderElectedAndRebalancingContinues(t *testing.T) {
 		return nil
 	})
 }
+
+func TestLeaseLeaderFailover_NewLeaderElectedAndRebalancingContinues(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
+	options := append(defaultWorkerOptions(), workerpkg.WithLeaderStrategy(workerpkg.LeaderStrategyLease))
+
+	worker1 := startTestWorker(t, "worker-1", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-1", nil),
+		newTestConsumer("consumer-2", "worker-1", nil),
+		newTestConsumer("consumer-3", "worker-1", nil),
+		newTestConsumer("consumer-4", "worker-1", nil),
+	}, options...)
+	worker2 := startTestWorker(t, "worker-2", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-2", nil),
+		newTestConsumer("consumer-2", "worker-2", nil),
+		newTestConsumer("consumer-3", "worker-2", nil),
+		newTestConsumer("consumer-4", "worker-2", nil),
+	}, options...)
+
+	waitForErr(t, defaultWaitTimeout, func() error {
+		counts := assignedConsumerCounts(getAssignments(t, controlDB))
+		values := []int{counts[worker1.worker.ID()], counts[worker2.worker.ID()]}
+		sort.Ints(values)
+		if values[0] != 2 || values[1] != 2 {
+			return fmt.Errorf("assignment split=%v want [2 2]", values)
+		}
+		return nil
+	})
+
+	worker1.stop(t)
+
+	waitForErr(t, defaultWaitTimeout, func() error {
+		counts := assignedConsumerCounts(getAssignments(t, controlDB))
+		if counts[worker2.worker.ID()] != 4 || len(counts) != 1 {
+			return fmt.Errorf("post-failover assignments=%v want worker-2 => 4", counts)
+		}
+		return nil
+	})
+
+	worker3 := startTestWorker(t, "worker-3", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-3", nil),
+		newTestConsumer("consumer-2", "worker-3", nil),
+		newTestConsumer("consumer-3", "worker-3", nil),
+		newTestConsumer("consumer-4", "worker-3", nil),
+	}, options...)
+
+	waitForErr(t, defaultWaitTimeout, func() error {
+		counts := assignedConsumerCounts(getAssignments(t, controlDB))
+		if len(counts) != 2 {
+			return fmt.Errorf("expected 2 workers after replacement, got %v", counts)
+		}
+		values := []int{counts[worker2.worker.ID()], counts[worker3.worker.ID()]}
+		sort.Ints(values)
+		if values[0] != 2 || values[1] != 2 {
+			return fmt.Errorf("replacement split=%v want [2 2]", values)
+		}
+		return nil
+	})
+
+	appended := appendTestEvents(t, controlDB, eventStore, 2, "Invoice")
+	latest := appended[len(appended)-1].GlobalPosition
+
+	waitForErr(t, defaultWaitTimeout, func() error {
+		for _, name := range []string{"consumer-1", "consumer-2", "consumer-3", "consumer-4"} {
+			if rows := getHandledRows(t, controlDB, name); len(rows) != 2 {
+				return fmt.Errorf("%s handled %d rows, want 2", name, len(rows))
+			}
+			if checkpoint := getCheckpoint(t, controlDB, name); checkpoint != latest {
+				return fmt.Errorf("%s checkpoint=%d want %d", name, checkpoint, latest)
+			}
+		}
+		labels := handledByAfter(t, controlDB, 0)
+		if len(labels) != 2 {
+			return fmt.Errorf("handled_by=%v want two active workers", labels)
+		}
+		return nil
+	})
+}
+
+func TestLeaseLeader_UncleanCrash_SurvivorTakesOver(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	options := append(defaultWorkerOptions(), workerpkg.WithLeaderStrategy(workerpkg.LeaderStrategyLease))
+
+	// Start only one worker first, it will become leader
+	worker1 := startTestWorker(t, "worker-1", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-1", nil),
+		newTestConsumer("consumer-2", "worker-1", nil),
+	}, options...)
+
+	// Wait for worker1 to become leader
+	waitForErr(t, defaultWaitTimeout, func() error {
+		leaderID, _, err := workerpostgres.GetLease(context.Background(), controlDB, workerpostgres.DefaultLeaderElectionTable)
+		if err != nil {
+			return err
+		}
+		if leaderID != worker1.worker.ID() {
+			return fmt.Errorf("expected worker-1 (%s) to be leader, got %s", worker1.worker.ID(), leaderID)
+		}
+		return nil
+	})
+
+	// Start worker2 (standby)
+	worker2 := startTestWorker(t, "worker-2", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-2", nil),
+		newTestConsumer("consumer-2", "worker-2", nil),
+	}, options...)
+
+	// Confirm worker2 does not become leader (worker1 is still leader)
+	time.Sleep(300 * time.Millisecond)
+	leaderID, _, err := workerpostgres.GetLease(context.Background(), controlDB, workerpostgres.DefaultLeaderElectionTable)
+	if err != nil {
+		t.Fatalf("failed to query lease: %v", err)
+	}
+	if leaderID != worker1.worker.ID() {
+		t.Fatalf("expected worker-1 to remain leader, got %s", leaderID)
+	}
+
+	// Now stop worker1. To simulate an unclean crash (where it doesn't release the lease),
+	// we will manually overwrite the lease table row to assign it to a fake dead leader
+	// with an active lease expiring in 400ms.
+	worker1.stop(t)
+
+	fakeLeaderID := uuid.New()
+	ctx := context.Background()
+	_, err = controlDB.ExecContext(ctx, `
+		UPDATE worker_leader_election
+		SET leader_id = $1,
+		    expires_at = NOW() + INTERVAL '400 milliseconds',
+		    updated_at = NOW()
+		WHERE lease_key = 'leader'
+	`, fakeLeaderID)
+	if err != nil {
+		t.Fatalf("failed to inject fake leader lease: %v", err)
+	}
+
+	// Verify worker2 is still not the leader immediately (since the fake lease is still active)
+	time.Sleep(100 * time.Millisecond)
+	currentLeader, _, err := workerpostgres.GetLease(ctx, controlDB, workerpostgres.DefaultLeaderElectionTable)
+	if err != nil {
+		t.Fatalf("query current lease: %v", err)
+	}
+	if currentLeader != fakeLeaderID {
+		t.Fatalf("expected lease to still be held by fake leader %s, got %s", fakeLeaderID, currentLeader)
+	}
+
+	// Wait for the fake lease to expire and worker2 to take over
+	waitForErr(t, 2*time.Second, func() error {
+		leader, _, err := workerpostgres.GetLease(ctx, controlDB, workerpostgres.DefaultLeaderElectionTable)
+		if err != nil {
+			return err
+		}
+		if leader != worker2.worker.ID() {
+			return fmt.Errorf("expected worker-2 (%s) to take over leadership, got %s", worker2.worker.ID(), leader)
+		}
+		return nil
+	})
+
+	// Once worker2 becomes leader, it should rebalance and assign the consumers to itself
+	waitForErr(t, defaultWaitTimeout, func() error {
+		counts := assignedConsumerCounts(getAssignments(t, controlDB))
+		if counts[worker2.worker.ID()] != 2 || len(counts) != 1 {
+			return fmt.Errorf("expected worker-2 to take all 2 assignments, got %v", counts)
+		}
+		return nil
+	})
+
+	worker2.stop(t)
+}
+

@@ -10,7 +10,7 @@ It builds on [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store
 ## Features
 
 - **Worker orchestrator** for starting, coordinating, and stopping consumer goroutines
-- **Leader election** using PostgreSQL advisory locks (`pg_try_advisory_lock`)
+- **Pluggable leader election**: choose between PostgreSQL session-level advisory locks (`pg_try_advisory_lock`) or a PgBouncer-safe table lease heartbeat strategy
 - **Horizontal scaling** through round-robin consumer assignment across active workers
 - **Gap-aware checkpointing**: probe the frontier, handle only safe rows, and audit stale-gap advances
 - **Adaptive polling** with exponential backoff and low-latency wakeups
@@ -26,7 +26,7 @@ At runtime, each worker instance:
 
 1. Performs a best-effort cleanup of very stale worker registrations, then registers itself in PostgreSQL and updates its heartbeat periodically.
 2. Starts a dispatcher that detects newly appended events.
-3. Participates in leader election via a PostgreSQL advisory lock.
+3. Participates in leader election (using advisory locks or database-backed leases).
 4. Lets the elected leader rebalance consumer assignments across live workers.
 5. Runs consumer goroutines only for the consumers assigned to that worker.
 6. Probes the global frontier outside the batch transaction, then processes only the current safe frontier inside the batch transaction.
@@ -197,6 +197,18 @@ w := worker.New(db, eventStore, consumers,
 | `WithDispatcherStrategy(strategy)` | Wakeup strategy: `worker.DispatcherStrategyPoll` or `worker.DispatcherStrategyNotify` | `worker.DispatcherStrategyPoll` |
 | `WithNotifyConnectionString(connStr string)` | PostgreSQL connection string used by the notify dispatcher | empty |
 | `WithNotifyChannel(channel string)` | PostgreSQL notification channel for the notify dispatcher | `worker_events` |
+| `WithLeaderStrategy(strategy)` | Leader election strategy: `worker.LeaderStrategyAdvisory` or `worker.LeaderStrategyLease` | `worker.LeaderStrategyAdvisory` |
+| `WithLeaderElectionTable(name string)` | Override leader election lease table name | `worker_leader_election` |
+
+### Leader election strategies
+
+#### Advisory lock strategy (Default)
+
+`worker.LeaderStrategyAdvisory` uses PostgreSQL session-level advisory locks. This strategy is extremely lightweight and releases immediately when a node goes down, but it requires a dedicated, persistent connection and is **incompatible** with connection poolers like PgBouncer in transaction pooling mode.
+
+#### Lease-based strategy (PgBouncer-safe)
+
+`worker.LeaderStrategyLease` coordinates leadership through a central lease table (`worker_leader_election`) using short-lived transactions. The leader periodically heartbeats/renews its lease record. If a leader crashes, other nodes can take over leadership after the lease duration (`HeartbeatTimeout`) has expired. This strategy is fully safe for deployments running behind PgBouncer in transaction pooling mode.
 
 ### Dispatcher strategies
 
