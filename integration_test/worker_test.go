@@ -906,11 +906,20 @@ func TestLeaseLeader_UncleanCrash_SurvivorTakesOver(t *testing.T) {
 	fakeLeaderID := uuid.New()
 	ctx := context.Background()
 	_, err = controlDB.ExecContext(ctx, `
-		UPDATE worker_leader_election
-		SET leader_id = $1,
-		    expires_at = NOW() + INTERVAL '400 milliseconds',
-		    updated_at = NOW()
-		WHERE lease_key = 'leader'
+		INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
+		VALUES ($1, NOW(), NOW(), NOW())
+	`, fakeLeaderID)
+	if err != nil {
+		t.Fatalf("failed to register fake leader: %v", err)
+	}
+
+	_, err = controlDB.ExecContext(ctx, `
+		INSERT INTO worker_leader_election (lease_key, leader_id, expires_at, updated_at)
+		VALUES ('leader', $1, NOW() + INTERVAL '400 milliseconds', NOW())
+		ON CONFLICT (lease_key) DO UPDATE
+		SET leader_id = EXCLUDED.leader_id,
+		    expires_at = EXCLUDED.expires_at,
+		    updated_at = EXCLUDED.updated_at
 	`, fakeLeaderID)
 	if err != nil {
 		t.Fatalf("failed to inject fake leader lease: %v", err)
@@ -949,4 +958,51 @@ func TestLeaseLeader_UncleanCrash_SurvivorTakesOver(t *testing.T) {
 
 	worker2.stop(t)
 }
+
+
+func TestLeaseLeader_CascadingDelete_SchemaConstraint(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	ctx := context.Background()
+	workerID := uuid.New()
+
+	// 1. Insert worker node
+	_, err := controlDB.ExecContext(ctx, `
+		INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
+		VALUES ($1, NOW(), NOW(), NOW())
+	`, workerID)
+	if err != nil {
+		t.Fatalf("failed to insert worker: %v", err)
+	}
+
+	// 2. Insert lease pointing to worker
+	_, err = controlDB.ExecContext(ctx, `
+		INSERT INTO worker_leader_election (lease_key, leader_id, expires_at)
+		VALUES ('leader', $1, NOW() + INTERVAL '1 hour')
+	`, workerID)
+	if err != nil {
+		t.Fatalf("failed to insert lease: %v", err)
+	}
+
+	// 3. Delete worker node
+	_, err = controlDB.ExecContext(ctx, `
+		DELETE FROM worker_nodes WHERE worker_id = $1
+	`, workerID)
+	if err != nil {
+		t.Fatalf("failed to delete worker node: %v", err)
+	}
+
+	// 4. Get lease and assert it was deleted (which GetLease returns as uuid.Nil because there is no row anymore)
+	leaderID, _, err := workerpostgres.GetLease(ctx, controlDB, workerpostgres.DefaultLeaderElectionTable)
+	if err != nil {
+		t.Fatalf("failed to get lease: %v", err)
+	}
+	if leaderID != uuid.Nil {
+		t.Fatalf("expected leader lease to be cascadingly deleted (GetLease returns uuid.Nil), got %s", leaderID)
+	}
+}
+
 
