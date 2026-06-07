@@ -151,6 +151,7 @@ func setupSchema(t testing.TB, db *sql.DB) {
 
 	_, err := db.ExecContext(ctx, `
 DROP TABLE IF EXISTS test_consumer_events CASCADE;
+DROP TABLE IF EXISTS worker_leader_election CASCADE;
 DROP TABLE IF EXISTS consumer_gap_skips CASCADE;
 DROP TABLE IF EXISTS consumer_checkpoints CASCADE;
 DROP TABLE IF EXISTS consumer_assignments CASCADE;
@@ -202,6 +203,7 @@ func cleanupTables(t testing.TB, db *sql.DB) {
 	if _, err := db.ExecContext(ctx, `
 TRUNCATE TABLE
 test_consumer_events,
+worker_leader_election,
 consumer_gap_skips,
 consumer_checkpoints,
 consumer_assignments,
@@ -806,6 +808,7 @@ func generateWorkerSQL(t testing.TB, outputDir string) []byte {
 		WorkerNodesTable:         workerpostgres.DefaultWorkerNodesTable,
 		ConsumerAssignmentsTable: workerpostgres.DefaultConsumerAssignmentsTable,
 		ConsumerCheckpointsTable: workerpostgres.DefaultConsumerCheckpointsTable,
+		LeaderElectionTable:      workerpostgres.DefaultLeaderElectionTable,
 	}
 	if err := workermigrations.GeneratePostgres(config); err != nil {
 		t.Fatalf("generate worker migration: %v", err)

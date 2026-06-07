@@ -36,6 +36,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	consumerAssignmentsTable := flags.String("consumer-assignments-table", config.ConsumerAssignmentsTable, "Name of consumer assignments table")
 	consumerCheckpointsTable := flags.String("consumer-checkpoints-table", config.ConsumerCheckpointsTable, "Name of consumer checkpoints table")
 	consumerGapSkipsTable := flags.String("consumer-gap-skips-table", config.ConsumerGapSkipsTable, "Name of consumer gap skips table")
+	leaderElectionTable := flags.String("leader-election-table", config.LeaderElectionTable, "Name of leader election table")
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -50,6 +51,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	config.ConsumerAssignmentsTable = *consumerAssignmentsTable
 	config.ConsumerCheckpointsTable = *consumerCheckpointsTable
 	config.ConsumerGapSkipsTable = *consumerGapSkipsTable
+	config.LeaderElectionTable = *leaderElectionTable
 
 	if *outputFilename != "" {
 		config.OutputFilename = *outputFilename

@@ -18,6 +18,16 @@ const (
 	DispatcherStrategyNotify DispatcherStrategy = "notify"
 )
 
+// LeaderStrategy selects how the worker coordinates leadership.
+type LeaderStrategy string
+
+const (
+	// LeaderStrategyAdvisory uses PostgreSQL session-level advisory locks.
+	LeaderStrategyAdvisory LeaderStrategy = "advisory"
+	// LeaderStrategyLease uses a lease table with heartbeat updates (PgBouncer-safe).
+	LeaderStrategyLease LeaderStrategy = "lease"
+)
+
 // Config holds all configurable values for a Worker.
 type Config struct {
 	Logger                   store.Logger
@@ -25,6 +35,8 @@ type Config struct {
 	ConsumerAssignmentsTable string
 	ConsumerCheckpointsTable string
 	ConsumerGapSkipsTable    string
+	LeaderStrategy           LeaderStrategy
+	LeaderElectionTable      string
 	DispatcherStrategy       DispatcherStrategy
 	NotifyConnectionString   string
 	NotifyChannel            string
@@ -65,6 +77,8 @@ func DefaultConfig() Config {
 		ConsumerAssignmentsTable: postgres.DefaultConsumerAssignmentsTable,
 		ConsumerCheckpointsTable: postgres.DefaultConsumerCheckpointsTable,
 		ConsumerGapSkipsTable:    postgres.DefaultConsumerGapSkipsTable,
+		LeaderStrategy:           LeaderStrategyAdvisory,
+		LeaderElectionTable:      postgres.DefaultLeaderElectionTable,
 		DispatcherStrategy:       DispatcherStrategyPoll,
 		NotifyChannel:            "worker_events",
 		StaleGapHarborLag:        8,
@@ -218,5 +232,19 @@ func WithNotifyConnectionString(connStr string) Option {
 func WithNotifyChannel(channel string) Option {
 	return func(c *Config) {
 		c.NotifyChannel = channel
+	}
+}
+
+// WithLeaderStrategy sets the leader election strategy.
+func WithLeaderStrategy(strategy LeaderStrategy) Option {
+	return func(c *Config) {
+		c.LeaderStrategy = strategy
+	}
+}
+
+// WithLeaderElectionTable sets the table name used for lease-based leader election.
+func WithLeaderElectionTable(name string) Option {
+	return func(c *Config) {
+		c.LeaderElectionTable = name
 	}
 }
