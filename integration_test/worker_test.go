@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -1004,5 +1005,61 @@ func TestLeaseLeader_CascadingDelete_SchemaConstraint(t *testing.T) {
 		t.Fatalf("expected leader lease to be cascadingly deleted (GetLease returns uuid.Nil), got %s", leaderID)
 	}
 }
+
+func TestLeaseLeader_ReleaseLease_Success(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	ctx := context.Background()
+	workerID := uuid.New()
+
+	// 1. Insert worker node
+	_, err := controlDB.ExecContext(ctx, `
+		INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
+		VALUES ($1, NOW(), NOW(), NOW())
+	`, workerID)
+	if err != nil {
+		t.Fatalf("failed to insert worker: %v", err)
+	}
+
+	// 2. Try to acquire lease
+	acquired, err := workerpostgres.TryAcquireLease(ctx, controlDB, workerpostgres.DefaultLeaderElectionTable, workerID, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	if !acquired {
+		t.Fatalf("expected lease to be acquired")
+	}
+
+	// 3. Release lease and verify it does not trigger foreign key constraint error
+	err = workerpostgres.ReleaseLease(ctx, controlDB, workerpostgres.DefaultLeaderElectionTable, workerID)
+	if err != nil {
+		t.Fatalf("failed to release lease: %v", err)
+	}
+
+	// 4. Verify leader_id in database is NULL (not uuid.Nil or any other value)
+	var leaderIDStr sql.NullString
+	err = controlDB.QueryRowContext(ctx, `
+		SELECT leader_id FROM worker_leader_election WHERE lease_key = 'leader'
+	`).Scan(&leaderIDStr)
+	if err != nil {
+		t.Fatalf("failed to query leader_id directly: %v", err)
+	}
+	if leaderIDStr.Valid {
+		t.Fatalf("expected leader_id database column to be NULL, but got %q", leaderIDStr.String)
+	}
+
+	// 5. GetLease should return uuid.Nil
+	leaderID, _, err := workerpostgres.GetLease(ctx, controlDB, workerpostgres.DefaultLeaderElectionTable)
+	if err != nil {
+		t.Fatalf("failed to get lease: %v", err)
+	}
+	if leaderID != uuid.Nil {
+		t.Fatalf("expected GetLease to return uuid.Nil, got %s", leaderID)
+	}
+}
+
 
 

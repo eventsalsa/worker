@@ -25,6 +25,7 @@ func TryAcquireLease(ctx context.Context, db DBTX, table string, workerID uuid.U
 		    expires_at = EXCLUDED.expires_at,
 		    updated_at = NOW()
 		WHERE target.leader_id = EXCLUDED.leader_id
+		   OR target.leader_id IS NULL
 		   OR target.expires_at < NOW()
 	`, table)
 
@@ -49,13 +50,13 @@ func ReleaseLease(ctx context.Context, db DBTX, table string, workerID uuid.UUID
 	//nolint:gosec // Table name is resolved from configuration.
 	query := fmt.Sprintf(`
 		UPDATE %s
-		SET leader_id = $1,
+		SET leader_id = NULL,
 		    expires_at = NOW() - INTERVAL '1 minute',
 		    updated_at = NOW()
-		WHERE lease_key = 'leader' AND leader_id = $2
+		WHERE lease_key = 'leader' AND leader_id = $1
 	`, table)
 
-	if _, err := db.ExecContext(ctx, query, uuid.Nil, workerID); err != nil {
+	if _, err := db.ExecContext(ctx, query, workerID); err != nil {
 		return fmt.Errorf("release lease for %s: %w", workerID, err)
 	}
 
@@ -73,7 +74,7 @@ func GetLease(ctx context.Context, db DBTX, table string) (uuid.UUID, time.Time,
 		WHERE lease_key = 'leader'
 	`, table)
 
-	var leaderID uuid.UUID
+	var leaderID uuid.NullUUID
 	var expiresAt time.Time
 	err := db.QueryRowContext(ctx, query).Scan(&leaderID, &expiresAt)
 	if err != nil {
@@ -83,5 +84,8 @@ func GetLease(ctx context.Context, db DBTX, table string) (uuid.UUID, time.Time,
 		return uuid.Nil, time.Time{}, fmt.Errorf("get lease: %w", err)
 	}
 
-	return leaderID, expiresAt, nil
+	if !leaderID.Valid {
+		return uuid.Nil, expiresAt, nil
+	}
+	return leaderID.UUID, expiresAt, nil
 }
