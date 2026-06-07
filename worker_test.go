@@ -1784,4 +1784,91 @@ func TestProcessBatch(t *testing.T) {
 			t.Fatalf("commitCalls = %d, want %d", state.commitCalls, staleGapRetryLimit)
 		}
 	})
+
+	t.Run("stale gap retries serialization failures for driver-agnostic errors", func(t *testing.T) {
+		originalNow := timeNow
+		defer func() { timeNow = originalNow }()
+
+		base := time.Date(2026, 4, 11, 0, 0, 0, 0, time.UTC)
+		now := base
+		timeNow = func() time.Time { return now }
+
+		workerID := uuid.New()
+		state := &stubDBState{
+			ownerID:      workerID.String(),
+			ownerValid:   true,
+			commitErrors: []error{&stubSQLStateError{code: "40001"}, nil},
+		}
+		storeStub := &stubWorkerStore{
+			events: []store.PersistedEvent{
+				makeEvent(2, "order"),
+				makeEvent(3, "order"),
+				makeEvent(4, "order"),
+			},
+		}
+		registeredConsumer := &scopedRecordingConsumer{
+			recordingConsumer: recordingConsumer{name: "users"},
+			aggregateTypes:    []string{"user"},
+		}
+		worker := &Worker{
+			id:    workerID,
+			db:    openStubDB(t, state),
+			store: storeStub,
+			config: Config{
+				BatchSize:         3,
+				BatchPause:        time.Millisecond,
+				StaleGapThreshold: 10 * time.Second,
+				StaleGapHarborLag: 1,
+				Logger:            store.NoOpLogger{},
+			},
+		}
+
+		gap := &gapState{}
+
+		first, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		if err != nil {
+			t.Fatalf("first processBatchWithGapState() error = %v", err)
+		}
+		if !first.blockedByGap {
+			t.Fatal("first processBatchWithGapState() blockedByGap = false, want true")
+		}
+
+		now = base.Add(11 * time.Second)
+
+		second, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		if err != nil {
+			t.Fatalf("second processBatchWithGapState() error = %v", err)
+		}
+		if !second.progressed {
+			t.Fatal("second processBatchWithGapState() progressed = false, want true")
+		}
+		if !second.staleSkipped {
+			t.Fatal("second processBatchWithGapState() staleSkipped = false, want true")
+		}
+		if second.checkpoint != 3 {
+			t.Fatalf("checkpoint = %d, want 3", second.checkpoint)
+		}
+		if len(registeredConsumer.handled) != 0 {
+			t.Fatalf("handled events = %d, want 0", len(registeredConsumer.handled))
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.commitCalls != 2 {
+			t.Fatalf("commitCalls = %d, want 2", state.commitCalls)
+		}
+	})
 }
+
+type stubSQLStateError struct {
+	code string
+}
+
+func (e *stubSQLStateError) Error() string {
+	return "mock sqlstate: " + e.code
+}
+
+func (e *stubSQLStateError) SQLState() string {
+	return e.code
+}
+
