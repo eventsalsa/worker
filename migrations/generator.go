@@ -129,7 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_consumer
 
 CREATE TABLE IF NOT EXISTS %s (
     lease_key TEXT PRIMARY KEY,
-    leader_id UUID NOT NULL,
+    leader_id UUID REFERENCES %s(worker_id) ON DELETE CASCADE,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS %s (
 		normalized.ConsumerGapSkipsTable,
 		indexNameComponent(normalized.ConsumerGapSkipsTable), normalized.ConsumerGapSkipsTable,
 		normalized.LeaderElectionTable,
+		normalized.WorkerNodesTable,
 	)
 }
 
