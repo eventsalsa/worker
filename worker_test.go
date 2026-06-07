@@ -1871,4 +1871,3 @@ func (e *stubSQLStateError) Error() string {
 func (e *stubSQLStateError) SQLState() string {
 	return e.code
 }
-
