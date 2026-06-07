@@ -966,8 +966,23 @@ func (w *Worker) prepareProbeForBatch(
 }
 
 func isSerializationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
 	var pqErr *pq.Error
-	return errors.As(err, &pqErr) && pqErr.Code == "40001"
+	if errors.As(err, &pqErr) && pqErr.Code == "40001" {
+		return true
+	}
+
+	type sqlStateCarrier interface {
+		SQLState() string
+	}
+	var carrier sqlStateCarrier
+	if errors.As(err, &carrier) && carrier.SQLState() == "40001" {
+		return true
+	}
+
+	return false
 }
 
 func (w *Worker) recordStaleGapSkip(

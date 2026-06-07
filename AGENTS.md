@@ -29,10 +29,9 @@ All contributors (including AI agents) must strictly follow these git practices:
 
 Anytime code is touched, the agent is required to run all checks prior to committing or finalizing the task.
 
-- **Required Commands (Must use `rtk` prefix):**
+- **Required Command (Must use `rtk` prefix):**
   ```bash
-  rtk make test
-  rtk make test-integration-local
+  rtk make check
   ```
 - **Rule Reference:** Always prefix shell commands with `rtk` as defined in the [RTK rules](.agents/rules/antigravity-rtk-rules.md).
 - **Exceptions:** The only exception to running these checks is when the changes are made *exclusively* to markdown (`.md`) files.
