@@ -4,7 +4,6 @@ package integration_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -14,7 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eventsalsa/store"
 	"github.com/eventsalsa/store/consumer"
@@ -39,7 +39,7 @@ type testEventBatch struct {
 }
 
 type controlledAppend struct {
-	tx     *sql.Tx
+	tx     pgx.Tx
 	events []store.PersistedEvent
 }
 
@@ -79,14 +79,14 @@ type gapSkipRow struct {
 
 type testWorkerHarness struct {
 	label    string
-	db       *sql.DB
+	db       *pgxpool.Pool
 	worker   *workerpkg.Worker
 	cancel   context.CancelFunc
 	errCh    chan error
 	stopOnce sync.Once
 }
 
-func openTestDB(t testing.TB) *sql.DB {
+func openTestDB(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 
 	host := os.Getenv("POSTGRES_HOST")
@@ -115,41 +115,61 @@ func openTestDB(t testing.TB) *sql.DB {
 	}
 
 	connStr := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		host,
-		port,
+		"postgres://%s:%s@%s:%s/%s?sslmode=disable",
 		user,
 		password,
+		host,
+		port,
 		dbName,
 	)
 
-	db, err := sql.Open("postgres", connStr)
+	ctx := context.Background()
+	config, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
-		t.Fatalf("open test db: %v", err)
+		t.Fatalf("parse test db config: %v", err)
 	}
 
-	db.SetMaxIdleConns(4)
-	db.SetMaxOpenConns(8)
-	db.SetConnMaxLifetime(0)
+	config.MaxConns = 8
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	if os.Getenv("PGX_TEST_SIMPLE_PROTOCOL") == "true" {
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	}
+	switch os.Getenv("PGX_TEST_QUERY_EXEC_MODE") {
+	case "cache_statement":
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
+	case "cache_describe":
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	case "describe_exec":
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	case "exec":
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	case "simple_protocol":
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	}
 
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
+	db, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+
+	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer pingCancel()
+
+	if err := db.Ping(pingCtx); err != nil {
+		db.Close()
 		t.Fatalf("ping test db: %v", err)
 	}
 
 	return db
 }
 
-func setupSchema(t testing.TB, db *sql.DB) {
+func setupSchema(t testing.TB, db *pgxpool.Pool) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err := db.ExecContext(ctx, `
+	_, err := db.Exec(ctx, `
 DROP TABLE IF EXISTS test_consumer_events CASCADE;
 DROP TABLE IF EXISTS worker_leader_election CASCADE;
 DROP TABLE IF EXISTS consumer_gap_skips CASCADE;
@@ -166,17 +186,17 @@ DROP TABLE IF EXISTS events CASCADE;
 	tmpDir := t.TempDir()
 	storeSQL := generateStoreSQL(t, tmpDir)
 
-	if _, err := db.ExecContext(ctx, string(storeSQL)); err != nil {
+	if _, err := db.Exec(ctx, string(storeSQL)); err != nil {
 		t.Fatalf("execute store migration: %v", err)
 	}
 
 	workerSQL := generateWorkerSQL(t, tmpDir)
 
-	if _, err := db.ExecContext(ctx, string(workerSQL)); err != nil {
+	if _, err := db.Exec(ctx, string(workerSQL)); err != nil {
 		t.Fatalf("execute worker migration: %v", err)
 	}
 
-	_, err = db.ExecContext(ctx, `
+	_, err = db.Exec(ctx, `
 CREATE TABLE test_consumer_events (
 consumer_name TEXT NOT NULL,
 global_position BIGINT NOT NULL,
@@ -194,13 +214,13 @@ PRIMARY KEY (consumer_name, global_position)
 	}
 }
 
-func cleanupTables(t testing.TB, db *sql.DB) {
+func cleanupTables(t testing.TB, db *pgxpool.Pool) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := db.ExecContext(ctx, `
+	if _, err := db.Exec(ctx, `
 TRUNCATE TABLE
 test_consumer_events,
 worker_leader_election,
@@ -216,7 +236,7 @@ RESTART IDENTITY CASCADE
 	}
 }
 
-func appendTestEvents(t testing.TB, db *sql.DB, eventStore *storepostgres.Store, count int, aggregateType string) []store.PersistedEvent {
+func appendTestEvents(t testing.TB, db *pgxpool.Pool, eventStore *storepostgres.Store, count int, aggregateType string) []store.PersistedEvent {
 	t.Helper()
 
 	return appendTestEventBatches(t, db, eventStore, testEventBatch{
@@ -225,7 +245,7 @@ func appendTestEvents(t testing.TB, db *sql.DB, eventStore *storepostgres.Store,
 	})
 }
 
-func appendTestEventBatches(t testing.TB, db *sql.DB, eventStore *storepostgres.Store, batches ...testEventBatch) []store.PersistedEvent {
+func appendTestEventBatches(t testing.TB, db *pgxpool.Pool, eventStore *storepostgres.Store, batches ...testEventBatch) []store.PersistedEvent {
 	t.Helper()
 
 	ctx := context.Background()
@@ -255,18 +275,18 @@ func appendTestEventBatches(t testing.TB, db *sql.DB, eventStore *storepostgres.
 			})
 		}
 
-		tx, err := db.BeginTx(ctx, nil)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin append transaction: %v", err)
 		}
 
 		result, err := eventStore.Append(ctx, tx, store.NoStream(), events)
 		if err != nil {
-			_ = tx.Rollback()
+			_ = tx.Rollback(ctx)
 			t.Fatalf("append test events: %v", err)
 		}
 
-		if err := tx.Commit(); err != nil {
+		if err := tx.Commit(ctx); err != nil {
 			t.Fatalf("commit append transaction: %v", err)
 		}
 
@@ -280,7 +300,7 @@ func appendTestEventBatches(t testing.TB, db *sql.DB, eventStore *storepostgres.
 	return appended
 }
 
-func beginControlledAppend(t testing.TB, db *sql.DB, eventStore *storepostgres.Store, batch testEventBatch) *controlledAppend {
+func beginControlledAppend(t testing.TB, db *pgxpool.Pool, eventStore *storepostgres.Store, batch testEventBatch) *controlledAppend {
 	t.Helper()
 
 	ctx := context.Background()
@@ -303,14 +323,14 @@ func beginControlledAppend(t testing.TB, db *sql.DB, eventStore *storepostgres.S
 		})
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin controlled append transaction: %v", err)
 	}
 
 	result, err := eventStore.Append(ctx, tx, store.NoStream(), events)
 	if err != nil {
-		_ = tx.Rollback()
+		_ = tx.Rollback(ctx)
 		t.Fatalf("controlled append: %v", err)
 	}
 
@@ -323,7 +343,7 @@ func beginControlledAppend(t testing.TB, db *sql.DB, eventStore *storepostgres.S
 func (c *controlledAppend) Commit(t testing.TB) {
 	t.Helper()
 
-	if err := c.tx.Commit(); err != nil {
+	if err := c.tx.Commit(context.Background()); err != nil {
 		t.Fatalf("commit controlled append transaction: %v", err)
 	}
 }
@@ -331,7 +351,7 @@ func (c *controlledAppend) Commit(t testing.TB) {
 func (c *controlledAppend) Rollback(t testing.TB) {
 	t.Helper()
 
-	if err := c.tx.Rollback(); err != nil {
+	if err := c.tx.Rollback(context.Background()); err != nil {
 		t.Fatalf("rollback controlled append transaction: %v", err)
 	}
 }
@@ -386,7 +406,7 @@ func (c *testConsumer) AggregateTypes() []string {
 	return append([]string(nil), c.aggregateTypes...)
 }
 
-func (c *testConsumer) Handle(ctx context.Context, tx *sql.Tx, event store.PersistedEvent) error {
+func (c *testConsumer) Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error {
 	c.mu.Lock()
 	c.attempts[event.GlobalPosition]++
 	attemptNo := c.attempts[event.GlobalPosition]
@@ -412,7 +432,7 @@ func (c *testConsumer) Handle(ctx context.Context, tx *sql.Tx, event store.Persi
 		return plan.err
 	}
 
-	_, err := tx.ExecContext(ctx, `
+	_, err := tx.Exec(ctx, `
 INSERT INTO test_consumer_events (
 consumer_name,
 global_position,
@@ -470,6 +490,9 @@ func startTestWorker(t *testing.T, label string, consumers []*testConsumer, opts
 	t.Helper()
 
 	db := openTestDB(t)
+	t.Cleanup(func() {
+		db.Close()
+	})
 	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
 	consumerList := make([]consumer.Consumer, 0, len(consumers))
 	for _, consumer := range consumers {
@@ -491,9 +514,6 @@ func startTestWorker(t *testing.T, label string, consumers []*testConsumer, opts
 	}()
 
 	t.Cleanup(func() {
-		_ = db.Close()
-	})
-	t.Cleanup(func() {
 		harness.stop(t)
 	})
 
@@ -502,7 +522,7 @@ func startTestWorker(t *testing.T, label string, consumers []*testConsumer, opts
 		defer cancel()
 
 		var count int
-		err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_nodes WHERE worker_id = $1`, w.ID()).Scan(&count)
+		err := db.QueryRow(ctx, `SELECT COUNT(*) FROM worker_nodes WHERE worker_id = $1`, w.ID()).Scan(&count)
 		if err != nil {
 			return err
 		}
@@ -548,18 +568,18 @@ func defaultWorkerOptions() []workerpkg.Option {
 	}
 }
 
-func latestGlobalPosition(t testing.TB, db *sql.DB, eventStore *storepostgres.Store) int64 {
+func latestGlobalPosition(t testing.TB, db *pgxpool.Pool, eventStore *storepostgres.Store) int64 {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		t.Fatalf("begin latest position tx: %v", err)
 	}
 	defer func() {
-		_ = tx.Rollback()
+		_ = tx.Rollback(ctx)
 	}()
 
 	position, err := eventStore.GetLatestGlobalPosition(ctx, tx)
@@ -570,7 +590,7 @@ func latestGlobalPosition(t testing.TB, db *sql.DB, eventStore *storepostgres.St
 	return position
 }
 
-func getCheckpoint(t testing.TB, db *sql.DB, consumerName string) int64 {
+func getCheckpoint(t testing.TB, db *pgxpool.Pool, consumerName string) int64 {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -584,7 +604,7 @@ func getCheckpoint(t testing.TB, db *sql.DB, consumerName string) int64 {
 	return position
 }
 
-func getAssignments(t testing.TB, db *sql.DB) []workerpostgres.ConsumerAssignment {
+func getAssignments(t testing.TB, db *pgxpool.Pool) []workerpostgres.ConsumerAssignment {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -608,13 +628,13 @@ func assignedConsumerCounts(assignments []workerpostgres.ConsumerAssignment) map
 	return counts
 }
 
-func getHandledRows(t testing.TB, db *sql.DB, consumerName string) []testConsumerEventRow {
+func getHandledRows(t testing.TB, db *pgxpool.Pool, consumerName string) []testConsumerEventRow {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, `
+	rows, err := db.Query(ctx, `
 SELECT consumer_name, global_position, aggregate_type, aggregate_id, event_type, handled_by, attempt_no
 FROM test_consumer_events
 WHERE consumer_name = $1
@@ -649,13 +669,13 @@ ORDER BY global_position ASC
 	return result
 }
 
-func getGapSkipRows(t testing.TB, db *sql.DB, consumerName string) []gapSkipRow {
+func getGapSkipRows(t testing.TB, db *pgxpool.Pool, consumerName string) []gapSkipRow {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, `
+	rows, err := db.Query(ctx, `
 SELECT consumer_name, gap_position, skip_to_position, highest_visible_position
 FROM consumer_gap_skips
 WHERE consumer_name = $1
@@ -686,13 +706,13 @@ ORDER BY id ASC
 	return result
 }
 
-func handledByAfter(t testing.TB, db *sql.DB, cutoff int64) []string {
+func handledByAfter(t testing.TB, db *pgxpool.Pool, cutoff int64) []string {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, `
+	rows, err := db.Query(ctx, `
 SELECT DISTINCT handled_by
 FROM test_consumer_events
 WHERE global_position > $1
@@ -719,41 +739,41 @@ ORDER BY handled_by ASC
 	return labels
 }
 
-func countWorkerRows(t testing.TB, db *sql.DB) int {
+func countWorkerRows(t testing.TB, db *pgxpool.Pool) int {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_nodes`).Scan(&count); err != nil {
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM worker_nodes`).Scan(&count); err != nil {
 		t.Fatalf("count worker rows: %v", err)
 	}
 
 	return count
 }
 
-func workerRowExists(t testing.TB, db *sql.DB, workerID uuid.UUID) bool {
+func workerRowExists(t testing.TB, db *pgxpool.Pool, workerID uuid.UUID) bool {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_nodes WHERE worker_id = $1`, workerID).Scan(&count); err != nil {
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM worker_nodes WHERE worker_id = $1`, workerID).Scan(&count); err != nil {
 		t.Fatalf("check worker row %s: %v", workerID, err)
 	}
 
 	return count == 1
 }
 
-func insertWorkerRow(t testing.TB, db *sql.DB, workerID uuid.UUID, heartbeatAt time.Time) {
+func insertWorkerRow(t testing.TB, db *pgxpool.Pool, workerID uuid.UUID, heartbeatAt time.Time) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err := db.ExecContext(ctx, `
+	_, err := db.Exec(ctx, `
 INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
 VALUES ($1, $2, NOW(), NOW())
 `, workerID, heartbeatAt)
@@ -762,13 +782,13 @@ VALUES ($1, $2, NOW(), NOW())
 	}
 }
 
-func assignConsumerToWorker(t testing.TB, db *sql.DB, consumerName string, workerID uuid.UUID) {
+func assignConsumerToWorker(t testing.TB, db *pgxpool.Pool, consumerName string, workerID uuid.UUID) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err := db.ExecContext(ctx, `
+	_, err := db.Exec(ctx, `
 UPDATE consumer_assignments
 SET worker_id = $1, updated_at = NOW()
 WHERE consumer_name = $2

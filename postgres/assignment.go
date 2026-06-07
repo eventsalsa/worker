@@ -2,11 +2,11 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // ConsumerAssignment represents a row in the consumer_assignments table.
@@ -18,14 +18,14 @@ type ConsumerAssignment struct {
 
 // EnsureConsumersRegistered upserts consumer names into the assignment table.
 // New consumers get NULL worker_id. Existing consumers are not modified.
-func EnsureConsumersRegistered(ctx context.Context, db DBTX, table string, consumerNames []string) error {
+func EnsureConsumersRegistered(ctx context.Context, db DB, table string, consumerNames []string) error {
 	if len(consumerNames) == 0 {
 		return nil
 	}
 
 	table = resolveTableName(table, DefaultConsumerAssignmentsTable)
 
-	args := make([]interface{}, 0, len(consumerNames))
+	args := make([]any, 0, len(consumerNames))
 	values := make([]string, 0, len(consumerNames))
 	for index, consumerName := range consumerNames {
 		args = append(args, consumerName)
@@ -39,7 +39,7 @@ func EnsureConsumersRegistered(ctx context.Context, db DBTX, table string, consu
 		ON CONFLICT (consumer_name) DO NOTHING
 	`, table, strings.Join(values, ", "))
 
-	if _, err := db.ExecContext(ctx, query, args...); err != nil {
+	if _, err := db.Exec(ctx, query, args...); err != nil {
 		return fmt.Errorf("ensure consumers registered: %w", err)
 	}
 
@@ -47,7 +47,7 @@ func EnsureConsumersRegistered(ctx context.Context, db DBTX, table string, consu
 }
 
 // GetAssignments returns all consumer assignments.
-func GetAssignments(ctx context.Context, db DBTX, table string) ([]ConsumerAssignment, error) {
+func GetAssignments(ctx context.Context, db DB, table string) ([]ConsumerAssignment, error) {
 	table = resolveTableName(table, DefaultConsumerAssignmentsTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -57,7 +57,7 @@ func GetAssignments(ctx context.Context, db DBTX, table string) ([]ConsumerAssig
 		ORDER BY consumer_name ASC
 	`, table)
 
-	rows, err := db.QueryContext(ctx, query)
+	rows, err := db.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("get assignments: %w", err)
 	}
@@ -66,18 +66,14 @@ func GetAssignments(ctx context.Context, db DBTX, table string) ([]ConsumerAssig
 	assignments := make([]ConsumerAssignment, 0)
 	for rows.Next() {
 		var assignment ConsumerAssignment
-		var workerID sql.NullString
+		var workerID *uuid.UUID
 
 		if err := rows.Scan(&assignment.ConsumerName, &workerID); err != nil {
 			return nil, fmt.Errorf("scan assignment: %w", err)
 		}
 
-		if workerID.Valid {
-			parsedWorkerID, err := uuid.Parse(workerID.String)
-			if err != nil {
-				return nil, fmt.Errorf("parse assigned worker id for consumer %s: %w", assignment.ConsumerName, err)
-			}
-			assignment.WorkerID = parsedWorkerID
+		if workerID != nil {
+			assignment.WorkerID = *workerID
 			assignment.Assigned = true
 		}
 
@@ -93,7 +89,7 @@ func GetAssignments(ctx context.Context, db DBTX, table string) ([]ConsumerAssig
 
 // SetAssignments atomically updates worker_id for the given consumer-to-worker mapping.
 // This should be called within a transaction by the leader during rebalancing.
-func SetAssignments(ctx context.Context, db DBTX, table string, assignments map[string]uuid.UUID) error {
+func SetAssignments(ctx context.Context, tx pgx.Tx, table string, assignments map[string]uuid.UUID) error {
 	if len(assignments) == 0 {
 		return nil
 	}
@@ -108,7 +104,7 @@ func SetAssignments(ctx context.Context, db DBTX, table string, assignments map[
 	`, table)
 
 	for consumerName, workerID := range assignments {
-		if _, err := db.ExecContext(ctx, query, workerID, consumerName); err != nil {
+		if _, err := tx.Exec(ctx, query, workerID, consumerName); err != nil {
 			return fmt.Errorf("set assignment for consumer %s: %w", consumerName, err)
 		}
 	}

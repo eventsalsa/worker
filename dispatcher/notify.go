@@ -2,12 +2,12 @@ package dispatcher
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/eventsalsa/store"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
 )
 
 // NotifyDispatcher listens for PostgreSQL NOTIFY events and emits wakeup signals.
@@ -16,7 +16,7 @@ import (
 type NotifyDispatcher struct {
 	querier PositionQuerier
 	logger  store.Logger
-	db      *sql.DB
+	db      txBeginner
 	connStr string
 	channel string
 	wakeup  wakeupBroadcaster
@@ -25,7 +25,7 @@ type NotifyDispatcher struct {
 }
 
 // NewNotifyDispatcher constructs a LISTEN/NOTIFY-based dispatcher.
-func NewNotifyDispatcher(connStr, channel string, db *sql.DB, querier PositionQuerier, logger store.Logger) *NotifyDispatcher {
+func NewNotifyDispatcher(connStr, channel string, db txBeginner, querier PositionQuerier, logger store.Logger) *NotifyDispatcher {
 	return &NotifyDispatcher{
 		connStr: connStr,
 		channel: channel,
@@ -37,20 +37,14 @@ func NewNotifyDispatcher(connStr, channel string, db *sql.DB, querier PositionQu
 }
 
 // Start begins the LISTEN/NOTIFY loop and blocks until ctx is canceled.
-func (d *NotifyDispatcher) Start(ctx context.Context) error { //nolint:gocyclo // select loop with fallback paths
+func (d *NotifyDispatcher) Start(ctx context.Context) error {
 	if !d.start.tryStart() {
 		return ErrAlreadyRunning
 	}
 	defer d.start.stop()
 
-	if d.db == nil {
-		return ErrNilDB
-	}
-	if d.querier == nil {
-		return ErrNilQuerier
-	}
-	if d.channel == "" {
-		return ErrEmptyChannel
+	if err := d.validate(); err != nil {
+		return err
 	}
 
 	position, err := d.latestPosition(ctx)
@@ -64,9 +58,11 @@ func (d *NotifyDispatcher) Start(ctx context.Context) error { //nolint:gocyclo /
 
 	d.logger.Debug(ctx, "notify dispatcher started", "channel", d.channel, "last_position", d.lastPos)
 
-	listener, notifyCh := d.newListener(ctx)
-	if listener != nil {
-		defer listener.Close()
+	notifyCh := make(chan struct{}, 1)
+	if d.connStr != "" {
+		go d.listenNotify(ctx, notifyCh)
+	} else {
+		d.logger.Info(ctx, "notify dispatcher falling back to reconciliation polling", "reason", "empty connection string")
 	}
 
 	reconcileTicker := time.NewTicker(defaultNotifyPollFallback)
@@ -81,20 +77,25 @@ func (d *NotifyDispatcher) Start(ctx context.Context) error { //nolint:gocyclo /
 			if err := d.reconcile(ctx); err != nil && ctx.Err() == nil {
 				d.logger.Error(ctx, "notify dispatcher reconciliation failed", "error", err)
 			}
-		case notification, ok := <-notifyCh:
-			if !ok {
-				notifyCh = nil
-				continue
-			}
-			if notification == nil {
-				continue
-			}
-			d.logger.Debug(ctx, "notify dispatcher received notification", "channel", notification.Channel)
+		case <-notifyCh:
 			if err := d.reconcile(ctx); err != nil && ctx.Err() == nil {
 				d.logger.Error(ctx, "notify dispatcher notification reconciliation failed", "error", err)
 			}
 		}
 	}
+}
+
+func (d *NotifyDispatcher) validate() error {
+	if d.db == nil {
+		return ErrNilDB
+	}
+	if d.querier == nil {
+		return ErrNilQuerier
+	}
+	if d.channel == "" {
+		return ErrEmptyChannel
+	}
+	return nil
 }
 
 // WakeupChan returns the wakeup channel shared with consumer goroutines.
@@ -103,12 +104,14 @@ func (d *NotifyDispatcher) WakeupChan() <-chan struct{} {
 }
 
 func (d *NotifyDispatcher) latestPosition(ctx context.Context) (int64, error) {
-	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return 0, err
 	}
 	defer func() {
-		_ = tx.Rollback() //nolint:errcheck // best-effort rollback on deferred read-only tx
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			d.logger.Error(ctx, "notify dispatcher latest position rollback failed", "error", rollbackErr)
+		}
 	}()
 
 	return d.querier.GetLatestGlobalPosition(ctx, tx)
@@ -134,27 +137,64 @@ func (d *NotifyDispatcher) signalWakeup() {
 	d.wakeup.Signal()
 }
 
-func (d *NotifyDispatcher) newListener(ctx context.Context) (listener *pq.Listener, notifyCh <-chan *pq.Notification) {
-	if d.connStr == "" {
-		d.logger.Info(ctx, "notify dispatcher falling back to reconciliation polling", "reason", "empty connection string")
-		return nil, nil
-	}
+func (d *NotifyDispatcher) listenNotify(ctx context.Context, notifyCh chan<- struct{}) {
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
 
-	listener = pq.NewListener(d.connStr, defaultListenerMinInterval, defaultListenerMaxInterval, func(event pq.ListenerEventType, err error) {
-		if err != nil {
-			d.logger.Error(context.Background(), "notify dispatcher listener event", "event", event, "error", err)
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		default:
 		}
-		if event == pq.ListenerEventReconnected {
-			d.logger.Info(context.Background(), "notify dispatcher reconnected", "channel", d.channel)
-		}
-	})
 
-	if err := listener.Listen(d.channel); err != nil {
-		d.logger.Error(ctx, "notify dispatcher listen failed, using reconciliation polling", "channel", d.channel, "error", err)
-		_ = listener.Close()
-		return nil, nil
+		conn, err := pgx.Connect(ctx, d.connStr)
+		if err != nil {
+			d.logger.Error(ctx, "notify dispatcher listener connection failed", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
+		}
+		backoff = 1 * time.Second
+
+		// Run LISTEN command
+		_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", d.channel))
+		if err != nil {
+			d.logger.Error(ctx, "notify dispatcher listen failed", "channel", d.channel, "error", err)
+			_ = conn.Close(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				continue
+			}
+		}
+
+		d.logger.Info(ctx, "notify dispatcher listening", "channel", d.channel)
+
+		for {
+			notification, err := conn.WaitForNotification(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					_ = conn.Close(ctx)
+					return
+				}
+				d.logger.Error(ctx, "notify dispatcher connection lost", "error", err)
+				_ = conn.Close(ctx)
+				break // break inner loop to reconnect
+			}
+
+			if notification != nil && notification.Channel == d.channel {
+				select {
+				case notifyCh <- struct{}{}:
+				default:
+					// Already has a pending signal, skip to avoid blocking
+				}
+			}
+		}
 	}
-
-	return listener, listener.Notify
 }

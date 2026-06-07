@@ -2,21 +2,21 @@ package worker
 
 import (
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/eventsalsa/store"
 	"github.com/eventsalsa/store/consumer"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eventsalsa/worker/dispatcher"
 	workerpostgres "github.com/eventsalsa/worker/postgres"
@@ -33,7 +33,7 @@ type stubWorkerStore struct {
 	lastLimit     int
 }
 
-func (s *stubWorkerStore) ReadEvents(_ context.Context, _ *sql.Tx, fromPosition int64, limit int) ([]store.PersistedEvent, error) {
+func (s *stubWorkerStore) ReadEvents(_ context.Context, _ pgx.Tx, fromPosition int64, limit int) ([]store.PersistedEvent, error) {
 	s.readCalls++
 	s.lastFrom = fromPosition
 	s.lastLimit = limit
@@ -58,7 +58,7 @@ func (s *stubWorkerStore) ReadEvents(_ context.Context, _ *sql.Tx, fromPosition 
 	return append([]store.PersistedEvent(nil), events...), nil
 }
 
-func (s *stubWorkerStore) GetLatestGlobalPosition(_ context.Context, _ *sql.Tx) (int64, error) {
+func (s *stubWorkerStore) GetLatestGlobalPosition(_ context.Context, _ pgx.Tx) (int64, error) {
 	if s.positionError != nil {
 		return 0, s.positionError
 	}
@@ -77,7 +77,7 @@ func (c *recordingConsumer) Name() string {
 }
 
 //nolint:gocritic // hugeParam: mirrors the production consumer contract.
-func (c *recordingConsumer) Handle(_ context.Context, _ *sql.Tx, event store.PersistedEvent) error {
+func (c *recordingConsumer) Handle(_ context.Context, _ pgx.Tx, event store.PersistedEvent) error {
 	call := len(c.handled) + 1
 	if c.failAt > 0 && call == c.failAt {
 		return c.handleErr
@@ -118,8 +118,8 @@ type stubDBState struct {
 	queryErr         error
 	ownerID          string
 	checkpointPos    int64
-	queryValues      []driver.Value
-	execArgs         [][]driver.NamedValue
+	queryValues      []any
+	execArgs         [][]any
 	execQueries      []string
 	execCalls        int
 	beginCalls       int
@@ -131,201 +131,360 @@ type stubDBState struct {
 	ownerValid       bool
 }
 
-type stubDBDriver struct {
+type stubPgxPool struct {
 	state *stubDBState
 }
 
-type stubDBConn struct {
-	state *stubDBState
-}
+//nolint:gocritic // hugeParam: implements PgxPool interface
+func (p *stubPgxPool) BeginTx(_ context.Context, _ pgx.TxOptions) (pgx.Tx, error) {
+	p.state.mu.Lock()
+	defer p.state.mu.Unlock()
 
-type stubDBTx struct {
-	state *stubDBState
-}
-
-type stubStmt struct{}
-
-type stubResult struct {
-	rowsAffected int64
-}
-
-type stubRows struct {
-	value    driver.Value
-	returned bool
-}
-
-var stubDriverCounter atomic.Int64
-
-func (d *stubDBDriver) Open(string) (driver.Conn, error) {
-	return &stubDBConn{state: d.state}, nil
-}
-
-func (c *stubDBConn) Prepare(string) (driver.Stmt, error) {
-	return stubStmt{}, nil
-}
-
-func (c *stubDBConn) Close() error {
-	return nil
-}
-
-func (c *stubDBConn) Begin() (driver.Tx, error) {
-	return c.BeginTx(context.Background(), driver.TxOptions{})
-}
-
-func (c *stubDBConn) BeginTx(_ context.Context, _ driver.TxOptions) (driver.Tx, error) {
-	c.state.mu.Lock()
-	defer c.state.mu.Unlock()
-
-	c.state.beginCalls++
-	c.state.ops = append(c.state.ops, "begin")
-	if c.state.beginErr != nil {
-		return nil, c.state.beginErr
+	p.state.beginCalls++
+	p.state.ops = append(p.state.ops, "begin")
+	if p.state.beginErr != nil {
+		return nil, p.state.beginErr
 	}
 
-	return &stubDBTx{state: c.state}, nil
+	return &stubPgxTx{state: p.state}, nil
 }
 
-func (c *stubDBConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	c.state.mu.Lock()
-	defer c.state.mu.Unlock()
+func (p *stubPgxPool) Acquire(_ context.Context) (*pgxpool.Conn, error) {
+	return nil, nil
+}
 
-	c.state.execCalls++
-	c.state.ops = append(c.state.ops, "exec")
-	c.state.execQueries = append(c.state.execQueries, query)
-	copiedArgs := append([]driver.NamedValue(nil), args...)
-	c.state.execArgs = append(c.state.execArgs, copiedArgs)
-	if c.state.execErr != nil {
-		return nil, c.state.execErr
+func (p *stubPgxPool) Exec(_ context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	p.state.mu.Lock()
+	defer p.state.mu.Unlock()
+
+	p.state.execCalls++
+	p.state.ops = append(p.state.ops, "exec")
+	p.state.execQueries = append(p.state.execQueries, sql)
+	p.state.execArgs = append(p.state.execArgs, arguments)
+
+	if p.state.execErr != nil {
+		return pgconn.NewCommandTag(""), p.state.execErr
 	}
 
 	rowsAffected := int64(1)
-	if len(c.state.execRowsAffected) > 0 {
-		index := c.state.execCalls - 1
-		if index >= len(c.state.execRowsAffected) {
-			index = len(c.state.execRowsAffected) - 1
+	if len(p.state.execRowsAffected) > 0 {
+		index := p.state.execCalls - 1
+		if index >= len(p.state.execRowsAffected) {
+			index = len(p.state.execRowsAffected) - 1
 		}
-		rowsAffected = c.state.execRowsAffected[index]
+		rowsAffected = p.state.execRowsAffected[index]
 	}
 
-	return stubResult{rowsAffected: rowsAffected}, nil
+	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", rowsAffected)), nil
 }
 
-func (c *stubDBConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	c.state.mu.Lock()
-	defer c.state.mu.Unlock()
+func (p *stubPgxPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	p.state.mu.Lock()
+	defer p.state.mu.Unlock()
 
-	c.state.queryCalls++
-	c.state.ops = append(c.state.ops, "query")
-	if c.state.queryErr != nil {
-		return nil, c.state.queryErr
+	p.state.queryCalls++
+	p.state.ops = append(p.state.ops, "query")
+	if p.state.queryErr != nil {
+		return nil, p.state.queryErr
 	}
 
-	if len(c.state.queryValues) > 0 {
-		index := c.state.queryCalls - 1
-		if index >= len(c.state.queryValues) {
-			index = len(c.state.queryValues) - 1
+	if len(p.state.queryValues) > 0 {
+		index := p.state.queryCalls - 1
+		if index >= len(p.state.queryValues) {
+			index = len(p.state.queryValues) - 1
 		}
-		if c.state.queryValues[index] == nil {
-			return &stubRows{returned: true}, nil
+		if p.state.queryValues[index] == nil {
+			return &stubPgxRows{returned: true}, nil
 		}
-		return &stubRows{value: c.state.queryValues[index]}, nil
+		return &stubPgxRows{value: p.state.queryValues[index]}, nil
 	}
 
-	if strings.Contains(query, "FROM consumer_checkpoints") {
-		return &stubRows{value: c.state.checkpointPos}, nil
+	if strings.Contains(sql, "FROM consumer_checkpoints") {
+		return &stubPgxRows{value: p.state.checkpointPos}, nil
 	}
 
-	if !c.state.ownerValid {
-		return &stubRows{returned: true}, nil
+	if !p.state.ownerValid {
+		return &stubPgxRows{returned: true}, nil
 	}
 
-	return &stubRows{value: c.state.ownerID}, nil
+	return &stubPgxRows{value: p.state.ownerID}, nil
 }
 
-func (t *stubDBTx) Commit() error {
-	t.state.mu.Lock()
-	defer t.state.mu.Unlock()
+func (p *stubPgxPool) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	p.state.mu.Lock()
+	defer p.state.mu.Unlock()
 
-	t.state.commitCalls++
-	t.state.ops = append(t.state.ops, "commit")
-	if len(t.state.commitErrors) > 0 {
-		index := t.state.commitCalls - 1
-		if index >= len(t.state.commitErrors) {
-			index = len(t.state.commitErrors) - 1
+	p.state.queryCalls++
+	p.state.ops = append(p.state.ops, "query_row")
+	if p.state.queryErr != nil {
+		return &stubPgxRow{err: p.state.queryErr}
+	}
+
+	if len(p.state.queryValues) > 0 {
+		index := p.state.queryCalls - 1
+		if index >= len(p.state.queryValues) {
+			index = len(p.state.queryValues) - 1
 		}
-		return t.state.commitErrors[index]
+		return &stubPgxRow{value: p.state.queryValues[index]}
 	}
 
-	return t.state.commitErr
+	if strings.Contains(sql, "FROM consumer_checkpoints") {
+		return &stubPgxRow{value: p.state.checkpointPos}
+	}
+
+	if !p.state.ownerValid {
+		return &stubPgxRow{err: pgx.ErrNoRows}
+	}
+
+	return &stubPgxRow{value: p.state.ownerID}
 }
 
-func (t *stubDBTx) Rollback() error {
-	t.state.mu.Lock()
-	defer t.state.mu.Unlock()
-
-	t.state.rollbackCalls++
-	t.state.ops = append(t.state.ops, "rollback")
-	return t.state.rollbackErr
+type stubPgxTx struct {
+	state *stubDBState
 }
 
-func (stubStmt) Close() error {
-	return nil
+func (tx *stubPgxTx) Begin(_ context.Context) (pgx.Tx, error) {
+	return nil, nil
 }
 
-func (stubStmt) NumInput() int {
-	return -1
+func (tx *stubPgxTx) Commit(_ context.Context) error {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+
+	tx.state.commitCalls++
+	tx.state.ops = append(tx.state.ops, "commit")
+	if len(tx.state.commitErrors) > 0 {
+		index := tx.state.commitCalls - 1
+		if index >= len(tx.state.commitErrors) {
+			index = len(tx.state.commitErrors) - 1
+		}
+		return tx.state.commitErrors[index]
+	}
+
+	return tx.state.commitErr
 }
 
-func (stubStmt) Exec([]driver.Value) (driver.Result, error) {
-	return stubResult{rowsAffected: 1}, nil
+func (tx *stubPgxTx) Rollback(_ context.Context) error {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+
+	tx.state.rollbackCalls++
+	tx.state.ops = append(tx.state.ops, "rollback")
+	return tx.state.rollbackErr
 }
 
-func (stubStmt) Query([]driver.Value) (driver.Rows, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (stubResult) LastInsertId() (int64, error) {
+func (tx *stubPgxTx) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, _ pgx.CopyFromSource) (int64, error) {
 	return 0, nil
 }
 
-func (r stubResult) RowsAffected() (int64, error) {
-	return r.rowsAffected, nil
-}
-
-func (r *stubRows) Columns() []string {
-	return []string{"worker_id"}
-}
-
-func (r *stubRows) Close() error {
+func (tx *stubPgxTx) SendBatch(_ context.Context, _ *pgx.Batch) pgx.BatchResults {
 	return nil
 }
 
-func (r *stubRows) Next(dest []driver.Value) error {
+func (tx *stubPgxTx) LargeObjects() pgx.LargeObjects {
+	return pgx.LargeObjects{}
+}
+
+func (tx *stubPgxTx) Prepare(_ context.Context, _, _ string) (*pgconn.StatementDescription, error) {
+	return nil, nil
+}
+
+func (tx *stubPgxTx) Exec(_ context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+
+	tx.state.execCalls++
+	tx.state.ops = append(tx.state.ops, "exec")
+	tx.state.execQueries = append(tx.state.execQueries, sql)
+	tx.state.execArgs = append(tx.state.execArgs, arguments)
+
+	if tx.state.execErr != nil {
+		return pgconn.NewCommandTag(""), tx.state.execErr
+	}
+
+	rowsAffected := int64(1)
+	if len(tx.state.execRowsAffected) > 0 {
+		index := tx.state.execCalls - 1
+		if index >= len(tx.state.execRowsAffected) {
+			index = len(tx.state.execRowsAffected) - 1
+		}
+		rowsAffected = tx.state.execRowsAffected[index]
+	}
+
+	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", rowsAffected)), nil
+}
+
+func (tx *stubPgxTx) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+
+	tx.state.queryCalls++
+	tx.state.ops = append(tx.state.ops, "query")
+	if tx.state.queryErr != nil {
+		return nil, tx.state.queryErr
+	}
+
+	if len(tx.state.queryValues) > 0 {
+		index := tx.state.queryCalls - 1
+		if index >= len(tx.state.queryValues) {
+			index = len(tx.state.queryValues) - 1
+		}
+		if tx.state.queryValues[index] == nil {
+			return &stubPgxRows{returned: true}, nil
+		}
+		return &stubPgxRows{value: tx.state.queryValues[index]}, nil
+	}
+
+	if strings.Contains(sql, "FROM consumer_checkpoints") {
+		return &stubPgxRows{value: tx.state.checkpointPos}, nil
+	}
+
+	if !tx.state.ownerValid {
+		return &stubPgxRows{returned: true}, nil
+	}
+
+	return &stubPgxRows{value: tx.state.ownerID}, nil
+}
+
+func (tx *stubPgxTx) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+
+	tx.state.queryCalls++
+	tx.state.ops = append(tx.state.ops, "query_row")
+	if tx.state.queryErr != nil {
+		return &stubPgxRow{err: tx.state.queryErr}
+	}
+
+	if len(tx.state.queryValues) > 0 {
+		index := tx.state.queryCalls - 1
+		if index >= len(tx.state.queryValues) {
+			index = len(tx.state.queryValues) - 1
+		}
+		return &stubPgxRow{value: tx.state.queryValues[index]}
+	}
+
+	if strings.Contains(sql, "FROM consumer_checkpoints") {
+		return &stubPgxRow{value: tx.state.checkpointPos}
+	}
+
+	if !tx.state.ownerValid {
+		return &stubPgxRow{err: pgx.ErrNoRows}
+	}
+
+	return &stubPgxRow{value: tx.state.ownerID}
+}
+
+func (tx *stubPgxTx) Conn() *pgx.Conn {
+	return nil
+}
+
+func setVal(dest, src any) {
+	if dest == nil || src == nil {
+		return
+	}
+	vDest := reflect.ValueOf(dest)
+	if vDest.Kind() != reflect.Ptr {
+		return
+	}
+
+	elem := vDest.Elem()
+	if elem.Kind() == reflect.Ptr {
+		if elem.IsNil() {
+			elem.Set(reflect.New(elem.Type().Elem()))
+		}
+		elem = elem.Elem()
+	}
+
+	switch srcVal := src.(type) {
+	case string:
+		if elem.Kind() == reflect.String {
+			elem.SetString(srcVal)
+		} else if elem.Type() == reflect.TypeOf(uuid.UUID{}) {
+			if parsed, err := uuid.Parse(srcVal); err == nil {
+				elem.Set(reflect.ValueOf(parsed))
+			}
+		}
+	case uuid.UUID:
+		if elem.Kind() == reflect.String {
+			elem.SetString(srcVal.String())
+		} else if elem.Type() == reflect.TypeOf(uuid.UUID{}) {
+			elem.Set(reflect.ValueOf(srcVal))
+		}
+	case int64:
+		if elem.Kind() == reflect.Int64 || elem.Kind() == reflect.Int {
+			elem.SetInt(srcVal)
+		}
+	}
+}
+
+type stubPgxRows struct {
+	value    any
+	returned bool
+}
+
+func (r *stubPgxRows) Close() {}
+
+func (r *stubPgxRows) Err() error {
+	return nil
+}
+
+func (r *stubPgxRows) CommandTag() pgconn.CommandTag {
+	return pgconn.CommandTag{}
+}
+
+func (r *stubPgxRows) FieldDescriptions() []pgconn.FieldDescription {
+	return nil
+}
+
+func (r *stubPgxRows) Next() bool {
+	return !r.returned
+}
+
+func (r *stubPgxRows) Scan(dest ...any) error {
 	if r.returned {
 		return io.EOF
 	}
 
-	dest[0] = r.value
+	if len(dest) > 0 {
+		setVal(dest[0], r.value)
+	}
+
 	r.returned = true
 	return nil
 }
 
-func openStubDB(t *testing.T, state *stubDBState) *sql.DB {
-	t.Helper()
+func (r *stubPgxRows) Values() ([]any, error) {
+	return []any{r.value}, nil
+}
 
-	driverName := fmt.Sprintf("worker_stub_%d", stubDriverCounter.Add(1))
-	sql.Register(driverName, &stubDBDriver{state: state})
+func (r *stubPgxRows) RawValues() [][]byte {
+	return nil
+}
 
-	db, err := sql.Open(driverName, "")
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
+func (r *stubPgxRows) Conn() *pgx.Conn {
+	return nil
+}
+
+type stubPgxRow struct {
+	value any
+	err   error
+}
+
+func (r *stubPgxRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
 	}
 
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
+	if len(dest) > 0 {
+		setVal(dest[0], r.value)
+	}
+	return nil
+}
 
-	return db
+func openStubDB(t *testing.T, state *stubDBState) PgxPool {
+	t.Helper()
+	return &stubPgxPool{state: state}
 }
 
 func TestNewUsesDefaultConfig(t *testing.T) {
@@ -978,10 +1137,10 @@ func TestProcessBatch(t *testing.T) {
 		if len(state.execArgs) != 1 || len(state.execArgs[0]) != 2 {
 			t.Fatalf("execArgs = %#v, want consumer name and checkpoint", state.execArgs)
 		}
-		if got := state.execArgs[0][0].Value; got != "orders" {
+		if got := state.execArgs[0][0]; got != "orders" {
 			t.Fatalf("checkpoint consumer arg = %v, want orders", got)
 		}
-		if got := state.execArgs[0][1].Value; got != int64(5) {
+		if got := state.execArgs[0][1]; got != int64(5) {
 			t.Fatalf("checkpoint position arg = %v, want 5", got)
 		}
 	})
@@ -1020,7 +1179,7 @@ func TestProcessBatch(t *testing.T) {
 	t.Run("checkpoint drift between probe and batch causes a quick re-probe", func(t *testing.T) {
 		workerID := uuid.New()
 		state := &stubDBState{
-			queryValues: []driver.Value{
+			queryValues: []any{
 				workerID.String(),
 				int64(5),
 			},
@@ -1648,7 +1807,7 @@ func TestProcessBatch(t *testing.T) {
 		state := &stubDBState{
 			ownerID:      workerID.String(),
 			ownerValid:   true,
-			commitErrors: []error{&pq.Error{Code: "40001"}, nil},
+			commitErrors: []error{&pgconn.PgError{Code: "40001"}, nil},
 		}
 		storeStub := &stubWorkerStore{
 			events: []store.PersistedEvent{
@@ -1723,9 +1882,9 @@ func TestProcessBatch(t *testing.T) {
 			ownerID:    workerID.String(),
 			ownerValid: true,
 			commitErrors: []error{
-				&pq.Error{Code: "40001"},
-				&pq.Error{Code: "40001"},
-				&pq.Error{Code: "40001"},
+				&pgconn.PgError{Code: "40001"},
+				&pgconn.PgError{Code: "40001"},
+				&pgconn.PgError{Code: "40001"},
 			},
 		}
 		storeStub := &stubWorkerStore{

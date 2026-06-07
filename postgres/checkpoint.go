@@ -2,14 +2,15 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // GetCheckpoint returns the last processed global position for a consumer.
 // It returns 0 if no checkpoint exists.
-func GetCheckpoint(ctx context.Context, db DBTX, table, consumerName string) (int64, error) {
+func GetCheckpoint(ctx context.Context, db DB, table, consumerName string) (int64, error) {
 	table = resolveTableName(table, DefaultConsumerCheckpointsTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -20,9 +21,9 @@ func GetCheckpoint(ctx context.Context, db DBTX, table, consumerName string) (in
 	`, table)
 
 	var position int64
-	err := db.QueryRowContext(ctx, query, consumerName).Scan(&position)
+	err := db.QueryRow(ctx, query, consumerName).Scan(&position)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("get checkpoint for consumer %s: %w", consumerName, err)
@@ -33,7 +34,7 @@ func GetCheckpoint(ctx context.Context, db DBTX, table, consumerName string) (in
 
 // GetCheckpointForUpdate returns the last processed global position for a
 // consumer while locking the checkpoint row for update.
-func GetCheckpointForUpdate(ctx context.Context, db DBTX, table, consumerName string) (int64, error) {
+func GetCheckpointForUpdate(ctx context.Context, tx pgx.Tx, table, consumerName string) (int64, error) {
 	table = resolveTableName(table, DefaultConsumerCheckpointsTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -45,9 +46,9 @@ func GetCheckpointForUpdate(ctx context.Context, db DBTX, table, consumerName st
 	`, table)
 
 	var position int64
-	err := db.QueryRowContext(ctx, query, consumerName).Scan(&position)
+	err := tx.QueryRow(ctx, query, consumerName).Scan(&position)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("lock checkpoint for consumer %s: %w", consumerName, err)
@@ -57,7 +58,7 @@ func GetCheckpointForUpdate(ctx context.Context, db DBTX, table, consumerName st
 }
 
 // SaveCheckpoint upserts the checkpoint for a consumer within the given transaction.
-func SaveCheckpoint(ctx context.Context, db DBTX, table, consumerName string, position int64) error {
+func SaveCheckpoint(ctx context.Context, tx pgx.Tx, table, consumerName string, position int64) error {
 	table = resolveTableName(table, DefaultConsumerCheckpointsTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -70,7 +71,7 @@ func SaveCheckpoint(ctx context.Context, db DBTX, table, consumerName string, po
 			updated_at = NOW()
 	`, table, table)
 
-	if _, err := db.ExecContext(ctx, query, consumerName, position); err != nil {
+	if _, err := tx.Exec(ctx, query, consumerName, position); err != nil {
 		return fmt.Errorf("save checkpoint for consumer %s: %w", consumerName, err)
 	}
 
@@ -78,7 +79,7 @@ func SaveCheckpoint(ctx context.Context, db DBTX, table, consumerName string, po
 }
 
 // EnsureCheckpointExists creates a checkpoint row if it doesn't exist (position 0).
-func EnsureCheckpointExists(ctx context.Context, db DBTX, table, consumerName string) error {
+func EnsureCheckpointExists(ctx context.Context, db DB, table, consumerName string) error {
 	table = resolveTableName(table, DefaultConsumerCheckpointsTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -88,7 +89,7 @@ func EnsureCheckpointExists(ctx context.Context, db DBTX, table, consumerName st
 		ON CONFLICT (consumer_name) DO NOTHING
 	`, table)
 
-	if _, err := db.ExecContext(ctx, query, consumerName); err != nil {
+	if _, err := db.Exec(ctx, query, consumerName); err != nil {
 		return fmt.Errorf("ensure checkpoint for consumer %s: %w", consumerName, err)
 	}
 

@@ -2,16 +2,17 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // TryAcquireLease attempts to acquire or renew the leadership lease for the worker.
 // It returns true if the lease was successfully acquired or renewed.
-func TryAcquireLease(ctx context.Context, db DBTX, table string, workerID uuid.UUID, leaseDuration time.Duration) (bool, error) {
+func TryAcquireLease(ctx context.Context, db DB, table string, workerID uuid.UUID, leaseDuration time.Duration) (bool, error) {
 	table = resolveTableName(table, DefaultLeaderElectionTable)
 
 	// We use INSERT ... ON CONFLICT DO UPDATE with an alias 'target' to ensure safety
@@ -29,22 +30,18 @@ func TryAcquireLease(ctx context.Context, db DBTX, table string, workerID uuid.U
 		   OR target.expires_at < NOW()
 	`, table)
 
-	res, err := db.ExecContext(ctx, query, workerID, leaseDuration.Microseconds())
+	res, err := db.Exec(ctx, query, workerID, leaseDuration.Microseconds())
 	if err != nil {
 		return false, fmt.Errorf("execute acquire lease for %s: %w", workerID, err)
 	}
 
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("rows affected acquire lease for %s: %w", workerID, err)
-	}
-
+	affected := res.RowsAffected()
 	return affected == 1, nil
 }
 
 // ReleaseLease voluntarily releases the leadership lease by expiring it and setting
-// the leader ID to uuid.Nil.
-func ReleaseLease(ctx context.Context, db DBTX, table string, workerID uuid.UUID) error {
+// the leader ID to NULL.
+func ReleaseLease(ctx context.Context, db DB, table string, workerID uuid.UUID) error {
 	table = resolveTableName(table, DefaultLeaderElectionTable)
 
 	//nolint:gosec // Table name is resolved from configuration.
@@ -56,7 +53,7 @@ func ReleaseLease(ctx context.Context, db DBTX, table string, workerID uuid.UUID
 		WHERE lease_key = 'leader' AND leader_id = $1
 	`, table)
 
-	if _, err := db.ExecContext(ctx, query, workerID); err != nil {
+	if _, err := db.Exec(ctx, query, workerID); err != nil {
 		return fmt.Errorf("release lease for %s: %w", workerID, err)
 	}
 
@@ -64,7 +61,7 @@ func ReleaseLease(ctx context.Context, db DBTX, table string, workerID uuid.UUID
 }
 
 // GetLease retrieves the current leader ID and expiration time from the lease table.
-func GetLease(ctx context.Context, db DBTX, table string) (uuid.UUID, time.Time, error) {
+func GetLease(ctx context.Context, db DB, table string) (uuid.UUID, time.Time, error) {
 	table = resolveTableName(table, DefaultLeaderElectionTable)
 
 	//nolint:gosec // Table name is resolved from configuration.
@@ -76,9 +73,9 @@ func GetLease(ctx context.Context, db DBTX, table string) (uuid.UUID, time.Time,
 
 	var leaderID uuid.NullUUID
 	var expiresAt time.Time
-	err := db.QueryRowContext(ctx, query).Scan(&leaderID, &expiresAt)
+	err := db.QueryRow(ctx, query).Scan(&leaderID, &expiresAt)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return uuid.Nil, time.Time{}, nil
 		}
 		return uuid.Nil, time.Time{}, fmt.Errorf("get lease: %w", err)
