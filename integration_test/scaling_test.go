@@ -4,13 +4,13 @@ package integration_test
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	storepostgres "github.com/eventsalsa/store/postgres"
 
@@ -141,7 +141,7 @@ func TestComprehensiveScaleUpAndDown(t *testing.T) {
 	assertAllEventsProcessedWithoutGaps(t, controlDB, consumerNames, allPositions, latest)
 }
 
-func assertBalancedAssignments(t *testing.T, db *sql.DB, expectedWorkers int, totalConsumers int, workerIDs []uuid.UUID) {
+func assertBalancedAssignments(t *testing.T, db *pgxpool.Pool, expectedWorkers int, totalConsumers int, workerIDs []uuid.UUID) {
 	t.Helper()
 
 	if err := checkBalancedAssignments(t, db, expectedWorkers, totalConsumers, workerIDs); err != nil {
@@ -149,7 +149,7 @@ func assertBalancedAssignments(t *testing.T, db *sql.DB, expectedWorkers int, to
 	}
 }
 
-func checkBalancedAssignments(t *testing.T, db *sql.DB, expectedWorkers int, totalConsumers int, workerIDs []uuid.UUID) error {
+func checkBalancedAssignments(t *testing.T, db *pgxpool.Pool, expectedWorkers int, totalConsumers int, workerIDs []uuid.UUID) error {
 	t.Helper()
 
 	assignments := getAssignments(t, db)
@@ -209,7 +209,7 @@ func checkBalancedAssignments(t *testing.T, db *sql.DB, expectedWorkers int, tot
 	return nil
 }
 
-func assertAllEventsProcessedWithoutGaps(t *testing.T, db *sql.DB, consumerNames []string, expectedPositions []int64, latest int64) {
+func assertAllEventsProcessedWithoutGaps(t *testing.T, db *pgxpool.Pool, consumerNames []string, expectedPositions []int64, latest int64) {
 	t.Helper()
 
 	for _, consumerName := range consumerNames {
@@ -236,7 +236,7 @@ func assertAllEventsProcessedWithoutGaps(t *testing.T, db *sql.DB, consumerNames
 	}
 }
 
-func checkConsumersProcessedStep(t *testing.T, db *sql.DB, consumerNames []string, expectedCount int, latest int64, cutoff int64, expectedLabels []string) error {
+func checkConsumersProcessedStep(t *testing.T, db *pgxpool.Pool, consumerNames []string, expectedCount int, latest int64, cutoff int64, expectedLabels []string) error {
 	t.Helper()
 
 	if err := checkConsumersCaughtUp(t, db, consumerNames, expectedCount, latest); err != nil {
@@ -261,7 +261,7 @@ func checkConsumersProcessedStep(t *testing.T, db *sql.DB, consumerNames []strin
 	return nil
 }
 
-func checkConsumersCaughtUp(t *testing.T, db *sql.DB, consumerNames []string, expectedCount int, latest int64) error {
+func checkConsumersCaughtUp(t *testing.T, db *pgxpool.Pool, consumerNames []string, expectedCount int, latest int64) error {
 	t.Helper()
 
 	for _, consumerName := range consumerNames {
@@ -277,7 +277,7 @@ func checkConsumersCaughtUp(t *testing.T, db *sql.DB, consumerNames []string, ex
 	return nil
 }
 
-func checkFreshHeartbeats(db *sql.DB, workerIDs []uuid.UUID, maxAge time.Duration) error {
+func checkFreshHeartbeats(db *pgxpool.Pool, workerIDs []uuid.UUID, maxAge time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -287,7 +287,7 @@ FROM %s
 ORDER BY worker_id ASC
 `, workerpostgres.DefaultWorkerNodesTable)
 
-	rows, err := db.QueryContext(ctx, query)
+	rows, err := db.Query(ctx, query)
 	if err != nil {
 		return fmt.Errorf("query worker heartbeats: %w", err)
 	}

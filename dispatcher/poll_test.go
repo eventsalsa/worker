@@ -2,16 +2,15 @@ package dispatcher
 
 import (
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"errors"
-	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/eventsalsa/store"
+	"github.com/jackc/pgx/v5"
 )
 
 type mockPositionQuerier struct {
@@ -21,7 +20,7 @@ type mockPositionQuerier struct {
 	mu        sync.Mutex
 }
 
-func (m *mockPositionQuerier) GetLatestGlobalPosition(_ context.Context, _ *sql.Tx) (int64, error) {
+func (m *mockPositionQuerier) GetLatestGlobalPosition(_ context.Context, _ pgx.Tx) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -45,107 +44,39 @@ func (m *mockPositionQuerier) CallCount() int {
 	return m.calls
 }
 
-type stubDriver struct{}
-
-var registerStubDriver sync.Once
-
-func (stubDriver) Open(string) (driver.Conn, error) {
-	return stubConn{}, nil
+type mockTxBeginner struct {
+	beginTxErr error
+	txCalls    int32
 }
 
-type stubConn struct{}
-
-func (stubConn) Prepare(string) (driver.Stmt, error) {
-	return stubStmt{}, nil
-}
-
-func (stubConn) Close() error {
-	return nil
-}
-
-func (stubConn) Begin() (driver.Tx, error) {
-	return stubTx{}, nil
-}
-
-func (stubConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
-	return stubTx{}, nil
-}
-
-type stubStmt struct{}
-
-func (stubStmt) Close() error {
-	return nil
-}
-
-func (stubStmt) NumInput() int {
-	return -1
-}
-
-func (stubStmt) Exec([]driver.Value) (driver.Result, error) {
-	return stubResult{}, nil
-}
-
-func (stubStmt) Query([]driver.Value) (driver.Rows, error) {
-	return stubRows{}, nil
-}
-
-type stubTx struct{}
-
-func (stubTx) Commit() error {
-	return nil
-}
-
-func (stubTx) Rollback() error {
-	return nil
-}
-
-type stubResult struct{}
-
-func (stubResult) LastInsertId() (int64, error) {
-	return 0, nil
-}
-
-func (stubResult) RowsAffected() (int64, error) {
-	return 0, nil
-}
-
-type stubRows struct{}
-
-func (stubRows) Columns() []string {
-	return nil
-}
-
-func (stubRows) Close() error {
-	return nil
-}
-
-func (stubRows) Next([]driver.Value) error {
-	return io.EOF
-}
-
-func openTestDB(t *testing.T) *sql.DB {
-	t.Helper()
-
-	const driverName = "dispatcher_stub"
-
-	registerStubDriver.Do(func() {
-		sql.Register(driverName, stubDriver{})
-	})
-
-	db, err := sql.Open(driverName, "")
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
+//nolint:gocritic // hugeParam: implements txBeginner interface
+func (m *mockTxBeginner) BeginTx(_ context.Context, _ pgx.TxOptions) (pgx.Tx, error) {
+	atomic.AddInt32(&m.txCalls, 1)
+	if m.beginTxErr != nil {
+		return nil, m.beginTxErr
 	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
+	return &mockTx{}, nil
+}
 
-	return db
+type mockTx struct {
+	pgx.Tx
+}
+
+func (m *mockTx) Rollback(_ context.Context) error {
+	return nil
+}
+
+func (m *mockTx) Commit(_ context.Context) error {
+	return nil
+}
+
+func newMockDB() *mockTxBeginner {
+	return &mockTxBeginner{}
 }
 
 func TestPollDispatcherSendsWakeupWhenPositionAdvances(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{5, 5, 6}}
-	dispatcher := NewPollDispatcher(openTestDB(t), querier, time.Millisecond, store.NoOpLogger{})
+	dispatcher := NewPollDispatcher(newMockDB(), querier, time.Millisecond, store.NoOpLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -170,7 +101,7 @@ func TestPollDispatcherSendsWakeupWhenPositionAdvances(t *testing.T) {
 
 func TestPollDispatcherBroadcastsWakeupToAllWaiters(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{5, 5, 6}}
-	dispatcher := NewPollDispatcher(openTestDB(t), querier, time.Millisecond, store.NoOpLogger{})
+	dispatcher := NewPollDispatcher(newMockDB(), querier, time.Millisecond, store.NoOpLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -209,7 +140,7 @@ func TestPollDispatcherBroadcastsWakeupToAllWaiters(t *testing.T) {
 
 func TestPollDispatcherDoesNotSendWakeupWhenPositionUnchanged(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{5, 5, 5, 5}}
-	dispatcher := NewPollDispatcher(openTestDB(t), querier, time.Millisecond, store.NoOpLogger{})
+	dispatcher := NewPollDispatcher(newMockDB(), querier, time.Millisecond, store.NoOpLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -237,7 +168,7 @@ func TestPollDispatcherDoesNotSendWakeupWhenPositionUnchanged(t *testing.T) {
 
 func TestPollDispatcherRespectsContextCancellation(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{2, 2, 2}}
-	dispatcher := NewPollDispatcher(openTestDB(t), querier, time.Millisecond, store.NoOpLogger{})
+	dispatcher := NewPollDispatcher(newMockDB(), querier, time.Millisecond, store.NoOpLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -259,7 +190,7 @@ func TestPollDispatcherRespectsContextCancellation(t *testing.T) {
 
 func TestPollDispatcherRejectsConcurrentStart(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{2, 2, 2}}
-	dispatcher := NewPollDispatcher(openTestDB(t), querier, time.Millisecond, store.NoOpLogger{})
+	dispatcher := NewPollDispatcher(newMockDB(), querier, time.Millisecond, store.NoOpLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -295,7 +226,7 @@ func TestPollDispatcherRejectsConcurrentStart(t *testing.T) {
 
 func TestPollDispatcherNonBlockingWakeupOnRepeatedSignals(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{1, 2, 3, 4, 5, 6, 7}}
-	dispatcher := NewPollDispatcher(openTestDB(t), querier, time.Millisecond, store.NoOpLogger{})
+	dispatcher := NewPollDispatcher(newMockDB(), querier, time.Millisecond, store.NoOpLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -338,7 +269,7 @@ func TestPollDispatcherStartRejectsNilDB(t *testing.T) {
 }
 
 func TestPollDispatcherStartRejectsNilQuerier(t *testing.T) {
-	dispatcher := NewPollDispatcher(openTestDB(t), nil, time.Millisecond, store.NoOpLogger{})
+	dispatcher := NewPollDispatcher(newMockDB(), nil, time.Millisecond, store.NoOpLogger{})
 
 	if err := dispatcher.Start(context.Background()); !errors.Is(err, ErrNilQuerier) {
 		t.Fatalf("Start() error = %v, want %v", err, ErrNilQuerier)
@@ -347,7 +278,7 @@ func TestPollDispatcherStartRejectsNilQuerier(t *testing.T) {
 
 func TestPollDispatcherStartReturnsInitialQueryError(t *testing.T) {
 	dispatcher := NewPollDispatcher(
-		openTestDB(t),
+		newMockDB(),
 		&mockPositionQuerier{positions: []int64{0}, errors: []error{errors.New("latest position failed")}},
 		time.Millisecond,
 		store.NoOpLogger{},

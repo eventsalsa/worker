@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +11,9 @@ import (
 	"github.com/eventsalsa/store"
 	"github.com/eventsalsa/store/consumer"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eventsalsa/worker/dispatcher"
 	"github.com/eventsalsa/worker/postgres"
@@ -58,6 +59,15 @@ type workerStore interface {
 	store.EventReader
 }
 
+// PgxPool abstracts the database connection pool capabilities required by the worker.
+type PgxPool interface {
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+	Acquire(ctx context.Context) (*pgxpool.Conn, error)
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Worker orchestrates distributed consumer execution for a single worker node.
 type Worker struct { //nolint:govet // fieldalignment: readability over marginal memory savings
 	config            Config
@@ -68,8 +78,8 @@ type Worker struct { //nolint:govet // fieldalignment: readability over marginal
 	fatalErrCh        chan error
 	runningConsumers  map[string]context.CancelFunc
 	consumerDone      map[string]chan struct{}
-	db                *sql.DB
-	leaderConn        *sql.Conn
+	db                PgxPool
+	leaderConn        *pgxpool.Conn
 	consumers         []consumer.Consumer
 	wg                sync.WaitGroup
 	mu                sync.Mutex
@@ -101,7 +111,7 @@ type frontierProbe struct {
 }
 
 // New constructs a Worker with the provided database handle, event store, and consumers.
-func New(db *sql.DB, eventStore workerStore, consumers []consumer.Consumer, opts ...Option) *Worker {
+func New(db PgxPool, eventStore workerStore, consumers []consumer.Consumer, opts ...Option) *Worker {
 	config := applyOptions(opts...)
 
 	return &Worker{
@@ -220,10 +230,6 @@ func (w *Worker) shutdown(registered *bool) {
 		}
 	}
 
-	if releaseErr := w.releaseLeaderConnection(shutdownCtx); releaseErr != nil {
-		logger.Error(shutdownCtx, "failed to release leader connection", "worker_id", w.id, "error", releaseErr)
-	}
-
 	done := make(chan struct{})
 	go func() {
 		w.wg.Wait()
@@ -243,6 +249,10 @@ func (w *Worker) shutdown(registered *bool) {
 		case <-time.After(defaultShutdownTimeout):
 			logger.Error(shutdownCtx, "worker shutdown did not complete after forced cancellation", "worker_id", w.id)
 		}
+	}
+
+	if releaseErr := w.releaseLeaderConnection(shutdownCtx); releaseErr != nil {
+		logger.Error(shutdownCtx, "failed to release leader connection", "worker_id", w.id, "error", releaseErr)
 	}
 }
 
@@ -419,7 +429,7 @@ func (w *Worker) leaderCycle(ctx context.Context) error {
 	}
 
 	if w.leaderActive() {
-		if pingErr := conn.PingContext(ctx); pingErr != nil {
+		if pingErr := conn.Ping(ctx); pingErr != nil {
 			w.logger().Error(ctx, "leader connection ping failed; relinquishing leadership", "worker_id", w.id, "error", pingErr)
 			w.dropLeaderConnection(ctx)
 			return nil
@@ -487,11 +497,11 @@ func (w *Worker) leaderCycleLease(ctx context.Context) error {
 		w.logger().Info(ctx, "worker became leader (lease acquired)", "worker_id", w.id)
 	}
 
-	conn, err := w.db.Conn(ctx)
+	conn, err := w.db.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("get connection for lease rebalance: %w", err)
 	}
-	defer conn.Close()
+	defer conn.Release()
 
 	if err := w.rebalance(ctx, conn); err != nil {
 		return fmt.Errorf("rebalance after leader lease acquisition: %w", err)
@@ -500,7 +510,7 @@ func (w *Worker) leaderCycleLease(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) rebalance(ctx context.Context, conn *sql.Conn) error {
+func (w *Worker) rebalance(ctx context.Context, conn *pgxpool.Conn) error {
 	liveWorkers, err := postgres.ListLiveWorkers(ctx, conn, w.workerNodesTable(), w.config.HeartbeatTimeout)
 	if err != nil {
 		return fmt.Errorf("list live workers: %w", err)
@@ -523,7 +533,7 @@ func (w *Worker) rebalance(ctx context.Context, conn *sql.Conn) error {
 
 	nextAssignments := postgres.ComputeAssignments(consumerNames, liveWorkers)
 
-	tx, err := conn.BeginTx(ctx, nil)
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin rebalance transaction: %w", err)
 	}
@@ -534,7 +544,7 @@ func (w *Worker) rebalance(ctx context.Context, conn *sql.Conn) error {
 			return
 		}
 
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
 			w.logger().Error(ctx, "rebalance rollback failed", "worker_id", w.id, "error", rollbackErr)
 		}
 	}()
@@ -543,7 +553,7 @@ func (w *Worker) rebalance(ctx context.Context, conn *sql.Conn) error {
 		return fmt.Errorf("apply assignments: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit rebalance transaction: %w", err)
 	}
 	committed = true
@@ -824,12 +834,12 @@ func (w *Worker) probeFrontier(
 	gapTracker *gapState,
 	checkpointOverride ...int64,
 ) (frontierProbe, error) {
-	tx, err := w.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := w.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return frontierProbe{}, fmt.Errorf("begin frontier probe transaction for consumer %s: %w", consumerName, err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
 			w.logger().Error(ctx, "frontier probe rollback failed", "worker_id", w.id, "consumer", consumerName, "error", rollbackErr)
 		}
 	}()
@@ -886,17 +896,17 @@ func (w *Worker) processProbedBatch(
 	registeredConsumer consumer.Consumer,
 	probe *frontierProbe,
 ) (processedBatch, error) {
-	txOptions := (*sql.TxOptions)(nil)
+	txOptions := pgx.TxOptions{}
 	attempts := 1
 	if probe.staleSkipped {
-		txOptions = &sql.TxOptions{Isolation: sql.LevelSerializable}
+		txOptions = pgx.TxOptions{IsoLevel: pgx.Serializable}
 		attempts = staleGapRetryLimit
 	}
 
 	originalProbe := *probe
 	for attempt := 0; attempt < attempts; attempt++ {
 		attemptProbe := originalProbe
-		result, err := w.processProbedBatchAttempt(ctx, registeredConsumer, &attemptProbe, txOptions)
+		result, err := w.processProbedBatchAttempt(ctx, registeredConsumer, &attemptProbe, &txOptions)
 		if err == nil {
 			*probe = attemptProbe
 			return result, nil
@@ -925,9 +935,9 @@ func (w *Worker) processProbedBatchAttempt(
 	ctx context.Context,
 	registeredConsumer consumer.Consumer,
 	probe *frontierProbe,
-	txOptions *sql.TxOptions,
+	txOptions *pgx.TxOptions,
 ) (processedBatch, error) {
-	tx, err := w.db.BeginTx(ctx, txOptions)
+	tx, err := w.db.BeginTx(ctx, *txOptions)
 	if err != nil {
 		return processedBatch{}, fmt.Errorf("begin transaction for consumer %s: %w", registeredConsumer.Name(), err)
 	}
@@ -938,7 +948,7 @@ func (w *Worker) processProbedBatchAttempt(
 			return
 		}
 
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
 			w.logger().Error(ctx, "consumer transaction rollback failed", "worker_id", w.id, "consumer", registeredConsumer.Name(), "error", rollbackErr)
 		}
 	}()
@@ -972,7 +982,7 @@ func (w *Worker) processProbedBatchAttempt(
 		return processedBatch{}, fmt.Errorf("save checkpoint for consumer %s: %w", registeredConsumer.Name(), err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return processedBatch{}, fmt.Errorf("commit transaction for consumer %s: %w", registeredConsumer.Name(), err)
 	}
 	committed = true
@@ -988,7 +998,7 @@ func (w *Worker) processProbedBatchAttempt(
 
 func (w *Worker) prepareProbeForBatch(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx pgx.Tx,
 	consumerName string,
 	probe *frontierProbe,
 ) (processedBatch, bool, error) {
@@ -1025,8 +1035,8 @@ func isSerializationFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code == "40001" {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "40001" {
 		return true
 	}
 
@@ -1043,7 +1053,7 @@ func isSerializationFailure(err error) bool {
 
 func (w *Worker) recordStaleGapSkip(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx pgx.Tx,
 	consumerName string,
 	probe *frontierProbe,
 ) error {
@@ -1068,7 +1078,7 @@ func (w *Worker) recordStaleGapSkip(
 
 func handleRelevantEvents(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx pgx.Tx,
 	registeredConsumer consumer.Consumer,
 	relevantEvents []store.PersistedEvent,
 ) error {
@@ -1106,7 +1116,7 @@ func buildFrontierProbe(checkpoint int64, rows []store.PersistedEvent, batchSize
 
 func (w *Worker) revalidateStaleGapSkip(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx pgx.Tx,
 	consumerName string,
 	probe *frontierProbe,
 ) error {
@@ -1214,7 +1224,7 @@ func (w *Worker) stopAllConsumers() {
 	}
 }
 
-func (w *Worker) ensureLeaderConn(ctx context.Context) (*sql.Conn, error) {
+func (w *Worker) ensureLeaderConn(ctx context.Context) (*pgxpool.Conn, error) {
 	w.mu.Lock()
 	if w.leaderConn != nil {
 		conn := w.leaderConn
@@ -1223,7 +1233,7 @@ func (w *Worker) ensureLeaderConn(ctx context.Context) (*sql.Conn, error) {
 	}
 	w.mu.Unlock()
 
-	conn, err := w.db.Conn(ctx)
+	conn, err := w.db.Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open leader connection: %w", err)
 	}
@@ -1233,9 +1243,7 @@ func (w *Worker) ensureLeaderConn(ctx context.Context) (*sql.Conn, error) {
 
 	if w.leaderConn != nil {
 		existing := w.leaderConn
-		if closeErr := conn.Close(); closeErr != nil {
-			w.logger().Error(ctx, "failed to close redundant leader connection", "worker_id", w.id, "error", closeErr)
-		}
+		existing.Release()
 		return existing, nil
 	}
 
@@ -1265,9 +1273,7 @@ func (w *Worker) releaseLeaderConnection(ctx context.Context) error {
 		return nil
 	}
 	defer func() {
-		if err := conn.Close(); err != nil {
-			w.logger().Error(ctx, "failed to close leader connection", "worker_id", w.id, "error", err)
-		}
+		conn.Release()
 	}()
 
 	if !wasLeader {
@@ -1295,9 +1301,7 @@ func (w *Worker) dropLeaderConnection(ctx context.Context) {
 	}
 
 	if conn != nil {
-		if err := conn.Close(); err != nil {
-			w.logger().Error(ctx, "failed to close leader connection", "worker_id", w.id, "error", err)
-		}
+		conn.Release()
 	}
 }
 
@@ -1506,7 +1510,7 @@ func applyOptions(opts ...Option) Config { //nolint:gocyclo // sequential valida
 	return config
 }
 
-func newDispatcher(db *sql.DB, eventStore workerStore, config *Config) dispatcher.Dispatcher {
+func newDispatcher(db PgxPool, eventStore workerStore, config *Config) dispatcher.Dispatcher {
 	if config.DispatcherStrategy == DispatcherStrategyNotify {
 		return dispatcher.NewNotifyDispatcher(
 			config.NotifyConnectionString,
@@ -1520,10 +1524,10 @@ func newDispatcher(db *sql.DB, eventStore workerStore, config *Config) dispatche
 	return dispatcher.NewPollDispatcher(db, eventStore, config.DispatcherInterval, config.Logger)
 }
 
-func applyAssignments(ctx context.Context, tx *sql.Tx, assignmentsTable string, assignments map[string]uuid.UUID) error {
+func applyAssignments(ctx context.Context, tx pgx.Tx, assignmentsTable string, assignments map[string]uuid.UUID) error {
 	if len(assignments) == 0 {
 		//nolint:gosec // G201: table name comes from trusted configuration
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s
 			SET worker_id = NULL, updated_at = NOW()
 			WHERE worker_id IS NOT NULL
@@ -1540,8 +1544,8 @@ func applyAssignments(ctx context.Context, tx *sql.Tx, assignmentsTable string, 
 	return nil
 }
 
-func (w *Worker) ensureConsumerOwnership(ctx context.Context, tx *sql.Tx, consumerName string) (bool, error) {
-	var workerID sql.NullString
+func (w *Worker) ensureConsumerOwnership(ctx context.Context, tx pgx.Tx, consumerName string) (bool, error) {
+	var workerID *uuid.UUID
 	//nolint:gosec // G201: table name comes from trusted configuration
 	query := fmt.Sprintf(`
 		SELECT worker_id
@@ -1549,15 +1553,15 @@ func (w *Worker) ensureConsumerOwnership(ctx context.Context, tx *sql.Tx, consum
 		WHERE consumer_name = $1
 		FOR UPDATE
 	`, w.consumerAssignmentsTable())
-	if err := tx.QueryRowContext(ctx, query, consumerName).Scan(&workerID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRow(ctx, query, consumerName).Scan(&workerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 
 		return false, err
 	}
 
-	return workerID.Valid && workerID.String == w.id.String(), nil
+	return workerID != nil && *workerID == w.id, nil
 }
 
 func nextPollInterval(current, maxInterval, base time.Duration) time.Duration {
@@ -1587,18 +1591,18 @@ func resolvedTableName(tableName, defaultTableName string) string {
 	return tableName
 }
 
-func tryAcquireLeaderLock(ctx context.Context, conn *sql.Conn) (bool, error) {
+func tryAcquireLeaderLock(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
 	var acquired bool
-	if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", postgres.LeaderLockKey).Scan(&acquired); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", postgres.LeaderLockKey).Scan(&acquired); err != nil {
 		return false, fmt.Errorf("acquire leader advisory lock: %w", err)
 	}
 
 	return acquired, nil
 }
 
-func releaseLeaderLock(ctx context.Context, conn *sql.Conn) error {
+func releaseLeaderLock(ctx context.Context, conn *pgxpool.Conn) error {
 	var released bool
-	if err := conn.QueryRowContext(ctx, "SELECT pg_advisory_unlock($1)", postgres.LeaderLockKey).Scan(&released); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT pg_advisory_unlock($1)", postgres.LeaderLockKey).Scan(&released); err != nil {
 		return fmt.Errorf("release leader advisory lock: %w", err)
 	}
 	if !released {

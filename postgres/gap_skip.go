@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // GapSkipRecord captures a durable record of a stale-gap advancement.
@@ -19,7 +20,7 @@ type GapSkipRecord struct {
 }
 
 // RecordGapSkip stores a durable audit record for a stale-gap advancement.
-func RecordGapSkip(ctx context.Context, db DBTX, table string, record *GapSkipRecord) error {
+func RecordGapSkip(ctx context.Context, tx pgx.Tx, table string, record *GapSkipRecord) error {
 	table = resolveTableName(table, DefaultConsumerGapSkipsTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -35,7 +36,7 @@ func RecordGapSkip(ctx context.Context, db DBTX, table string, record *GapSkipRe
 		) VALUES ($1, $2, $3, $4, $5, $6, NOW())
 	`, table)
 
-	if _, err := db.ExecContext(
+	if _, err := tx.Exec(
 		ctx,
 		query,
 		record.ConsumerName,

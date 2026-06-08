@@ -2,12 +2,12 @@ package dispatcher
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/eventsalsa/store"
+	"github.com/jackc/pgx/v5"
 )
 
 // PollDispatcher checks the latest global position on a fixed interval and emits
@@ -15,7 +15,7 @@ import (
 type PollDispatcher struct {
 	querier  PositionQuerier
 	logger   store.Logger
-	db       *sql.DB
+	db       txBeginner
 	wakeup   wakeupBroadcaster
 	interval time.Duration
 	lastPos  int64
@@ -23,7 +23,7 @@ type PollDispatcher struct {
 }
 
 // NewPollDispatcher constructs a poll-based dispatcher.
-func NewPollDispatcher(db *sql.DB, querier PositionQuerier, interval time.Duration, logger store.Logger) *PollDispatcher {
+func NewPollDispatcher(db txBeginner, querier PositionQuerier, interval time.Duration, logger store.Logger) *PollDispatcher {
 	return &PollDispatcher{
 		db:       db,
 		querier:  querier,
@@ -93,7 +93,7 @@ func (d *PollDispatcher) WakeupChan() <-chan struct{} {
 }
 
 func (d *PollDispatcher) latestPosition(ctx context.Context) (int64, error) {
-	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return 0, ctx.Err()
@@ -101,7 +101,9 @@ func (d *PollDispatcher) latestPosition(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	defer func() {
-		_ = tx.Rollback() //nolint:errcheck // best-effort rollback on deferred read-only tx
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			d.logger.Error(ctx, "poll dispatcher latest position rollback failed", "error", rollbackErr)
+		}
 	}()
 
 	return d.querier.GetLatestGlobalPosition(ctx, tx)

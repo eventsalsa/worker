@@ -14,7 +14,7 @@ import (
 var ErrWorkerRegistrationMissing = errors.New("worker registration missing")
 
 // RegisterWorker inserts a new worker node with the given UUID.
-func RegisterWorker(ctx context.Context, db DBTX, table string, workerID uuid.UUID) error {
+func RegisterWorker(ctx context.Context, db DB, table string, workerID uuid.UUID) error {
 	table = resolveTableName(table, DefaultWorkerNodesTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -23,7 +23,7 @@ func RegisterWorker(ctx context.Context, db DBTX, table string, workerID uuid.UU
 		VALUES ($1, NOW(), NOW(), NOW())
 	`, table)
 
-	if _, err := db.ExecContext(ctx, query, workerID); err != nil {
+	if _, err := db.Exec(ctx, query, workerID); err != nil {
 		return fmt.Errorf("register worker %s: %w", workerID, err)
 	}
 
@@ -31,7 +31,7 @@ func RegisterWorker(ctx context.Context, db DBTX, table string, workerID uuid.UU
 }
 
 // CleanupStaleWorkers deletes worker rows older than the given threshold.
-func CleanupStaleWorkers(ctx context.Context, db DBTX, table string, olderThan time.Duration) (int64, error) {
+func CleanupStaleWorkers(ctx context.Context, db DB, table string, olderThan time.Duration) (int64, error) {
 	if olderThan <= 0 {
 		return 0, fmt.Errorf("cleanup stale workers: olderThan must be positive")
 	}
@@ -44,21 +44,17 @@ func CleanupStaleWorkers(ctx context.Context, db DBTX, table string, olderThan t
 		WHERE heartbeat_at < NOW() - ($1 * INTERVAL '1 microsecond')
 	`, table)
 
-	result, err := db.ExecContext(ctx, query, olderThan.Microseconds())
+	result, err := db.Exec(ctx, query, olderThan.Microseconds())
 	if err != nil {
 		return 0, fmt.Errorf("cleanup stale workers older than %s: %w", olderThan, err)
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("rows affected cleaning stale workers older than %s: %w", olderThan, err)
-	}
-
+	affected := result.RowsAffected()
 	return affected, nil
 }
 
 // UpdateHeartbeat updates the heartbeat timestamp for a worker.
-func UpdateHeartbeat(ctx context.Context, db DBTX, table string, workerID uuid.UUID) error {
+func UpdateHeartbeat(ctx context.Context, db DB, table string, workerID uuid.UUID) error {
 	table = resolveTableName(table, DefaultWorkerNodesTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -68,15 +64,12 @@ func UpdateHeartbeat(ctx context.Context, db DBTX, table string, workerID uuid.U
 		WHERE worker_id = $1
 	`, table)
 
-	result, err := db.ExecContext(ctx, query, workerID)
+	result, err := db.Exec(ctx, query, workerID)
 	if err != nil {
 		return fmt.Errorf("update heartbeat for worker %s: %w", workerID, err)
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("rows affected updating heartbeat for worker %s: %w", workerID, err)
-	}
+	affected := result.RowsAffected()
 	if affected == 0 {
 		return fmt.Errorf("update heartbeat for worker %s: %w", workerID, ErrWorkerRegistrationMissing)
 	}
@@ -85,7 +78,7 @@ func UpdateHeartbeat(ctx context.Context, db DBTX, table string, workerID uuid.U
 }
 
 // ListLiveWorkers returns worker IDs whose heartbeat is within the timeout threshold.
-func ListLiveWorkers(ctx context.Context, db DBTX, table string, timeout time.Duration) ([]uuid.UUID, error) {
+func ListLiveWorkers(ctx context.Context, db DB, table string, timeout time.Duration) ([]uuid.UUID, error) {
 	table = resolveTableName(table, DefaultWorkerNodesTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -96,7 +89,7 @@ func ListLiveWorkers(ctx context.Context, db DBTX, table string, timeout time.Du
 		ORDER BY worker_id ASC
 	`, table)
 
-	rows, err := db.QueryContext(ctx, query, timeout.Microseconds())
+	rows, err := db.Query(ctx, query, timeout.Microseconds())
 	if err != nil {
 		return nil, fmt.Errorf("list live workers: %w", err)
 	}
@@ -119,7 +112,7 @@ func ListLiveWorkers(ctx context.Context, db DBTX, table string, timeout time.Du
 }
 
 // RemoveWorker deletes a worker node row.
-func RemoveWorker(ctx context.Context, db DBTX, table string, workerID uuid.UUID) error {
+func RemoveWorker(ctx context.Context, db DB, table string, workerID uuid.UUID) error {
 	table = resolveTableName(table, DefaultWorkerNodesTable)
 
 	//nolint:gosec // G201: table name comes from trusted configuration.
@@ -128,7 +121,7 @@ func RemoveWorker(ctx context.Context, db DBTX, table string, workerID uuid.UUID
 		WHERE worker_id = $1
 	`, table)
 
-	if _, err := db.ExecContext(ctx, query, workerID); err != nil {
+	if _, err := db.Exec(ctx, query, workerID); err != nil {
 		return fmt.Errorf("remove worker %s: %w", workerID, err)
 	}
 

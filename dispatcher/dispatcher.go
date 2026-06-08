@@ -2,12 +2,12 @@ package dispatcher
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"sync"
 	"time"
 
 	"github.com/eventsalsa/store"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -45,11 +45,16 @@ type Dispatcher interface {
 	WakeupChan() <-chan struct{}
 }
 
+// txBeginner abstracts the ability to start transactions.
+type txBeginner interface {
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+}
+
 // PositionQuerier queries the latest global position from the event store.
 type PositionQuerier interface {
 	// GetLatestGlobalPosition returns the highest global_position currently present in the event log.
 	// Returns 0 when no events exist.
-	GetLatestGlobalPosition(ctx context.Context, tx *sql.Tx) (int64, error)
+	GetLatestGlobalPosition(ctx context.Context, tx pgx.Tx) (int64, error)
 }
 
 func normalizedPollInterval(interval time.Duration) time.Duration {

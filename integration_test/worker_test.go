@@ -4,7 +4,6 @@ package integration_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -906,7 +905,7 @@ func TestLeaseLeader_UncleanCrash_SurvivorTakesOver(t *testing.T) {
 
 	fakeLeaderID := uuid.New()
 	ctx := context.Background()
-	_, err = controlDB.ExecContext(ctx, `
+	_, err = controlDB.Exec(ctx, `
 		INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
 		VALUES ($1, NOW(), NOW(), NOW())
 	`, fakeLeaderID)
@@ -914,7 +913,7 @@ func TestLeaseLeader_UncleanCrash_SurvivorTakesOver(t *testing.T) {
 		t.Fatalf("failed to register fake leader: %v", err)
 	}
 
-	_, err = controlDB.ExecContext(ctx, `
+	_, err = controlDB.Exec(ctx, `
 		INSERT INTO worker_leader_election (lease_key, leader_id, expires_at, updated_at)
 		VALUES ('leader', $1, NOW() + INTERVAL '400 milliseconds', NOW())
 		ON CONFLICT (lease_key) DO UPDATE
@@ -960,7 +959,6 @@ func TestLeaseLeader_UncleanCrash_SurvivorTakesOver(t *testing.T) {
 	worker2.stop(t)
 }
 
-
 func TestLeaseLeader_CascadingDelete_SchemaConstraint(t *testing.T) {
 	controlDB := openTestDB(t)
 	defer controlDB.Close()
@@ -971,7 +969,7 @@ func TestLeaseLeader_CascadingDelete_SchemaConstraint(t *testing.T) {
 	workerID := uuid.New()
 
 	// 1. Insert worker node
-	_, err := controlDB.ExecContext(ctx, `
+	_, err := controlDB.Exec(ctx, `
 		INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
 		VALUES ($1, NOW(), NOW(), NOW())
 	`, workerID)
@@ -980,7 +978,7 @@ func TestLeaseLeader_CascadingDelete_SchemaConstraint(t *testing.T) {
 	}
 
 	// 2. Insert lease pointing to worker
-	_, err = controlDB.ExecContext(ctx, `
+	_, err = controlDB.Exec(ctx, `
 		INSERT INTO worker_leader_election (lease_key, leader_id, expires_at)
 		VALUES ('leader', $1, NOW() + INTERVAL '1 hour')
 	`, workerID)
@@ -989,7 +987,7 @@ func TestLeaseLeader_CascadingDelete_SchemaConstraint(t *testing.T) {
 	}
 
 	// 3. Delete worker node
-	_, err = controlDB.ExecContext(ctx, `
+	_, err = controlDB.Exec(ctx, `
 		DELETE FROM worker_nodes WHERE worker_id = $1
 	`, workerID)
 	if err != nil {
@@ -1016,7 +1014,7 @@ func TestLeaseLeader_ReleaseLease_Success(t *testing.T) {
 	workerID := uuid.New()
 
 	// 1. Insert worker node
-	_, err := controlDB.ExecContext(ctx, `
+	_, err := controlDB.Exec(ctx, `
 		INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
 		VALUES ($1, NOW(), NOW(), NOW())
 	`, workerID)
@@ -1040,15 +1038,15 @@ func TestLeaseLeader_ReleaseLease_Success(t *testing.T) {
 	}
 
 	// 4. Verify leader_id in database is NULL (not uuid.Nil or any other value)
-	var leaderIDStr sql.NullString
-	err = controlDB.QueryRowContext(ctx, `
+	var leaderIDStr *string
+	err = controlDB.QueryRow(ctx, `
 		SELECT leader_id FROM worker_leader_election WHERE lease_key = 'leader'
 	`).Scan(&leaderIDStr)
 	if err != nil {
 		t.Fatalf("failed to query leader_id directly: %v", err)
 	}
-	if leaderIDStr.Valid {
-		t.Fatalf("expected leader_id database column to be NULL, but got %q", leaderIDStr.String)
+	if leaderIDStr != nil {
+		t.Fatalf("expected leader_id database column to be NULL, but got %q", *leaderIDStr)
 	}
 
 	// 5. GetLease should return uuid.Nil
@@ -1060,6 +1058,3 @@ func TestLeaseLeader_ReleaseLease_Success(t *testing.T) {
 		t.Fatalf("expected GetLease to return uuid.Nil, got %s", leaderID)
 	}
 }
-
-
-

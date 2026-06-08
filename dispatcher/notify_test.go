@@ -12,7 +12,7 @@ import (
 
 func TestNotifyDispatcherReconcileSendsWakeupWhenPositionAdvances(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{6}}
-	dispatcher := NewNotifyDispatcher("", "worker_events", openTestDB(t), querier, store.NoOpLogger{})
+	dispatcher := NewNotifyDispatcher("", "worker_events", newMockDB(), querier, store.NoOpLogger{})
 	dispatcher.lastPos = 5
 
 	// Capture channel before reconcile so we observe the close-and-replace signal.
@@ -27,7 +27,7 @@ func TestNotifyDispatcherReconcileSendsWakeupWhenPositionAdvances(t *testing.T) 
 
 func TestNotifyDispatcherRejectsConcurrentStart(t *testing.T) {
 	querier := &mockPositionQuerier{positions: []int64{3, 3, 3}}
-	dispatcher := NewNotifyDispatcher("", "worker_events", openTestDB(t), querier, store.NoOpLogger{})
+	dispatcher := NewNotifyDispatcher("", "worker_events", newMockDB(), querier, store.NoOpLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -70,7 +70,7 @@ func TestNotifyDispatcherStartRejectsNilDB(t *testing.T) {
 }
 
 func TestNotifyDispatcherStartRejectsEmptyChannel(t *testing.T) {
-	dispatcher := NewNotifyDispatcher("", "", openTestDB(t), &mockPositionQuerier{positions: []int64{1}}, store.NoOpLogger{})
+	dispatcher := NewNotifyDispatcher("", "", newMockDB(), &mockPositionQuerier{positions: []int64{1}}, store.NoOpLogger{})
 
 	if err := dispatcher.Start(context.Background()); !errors.Is(err, ErrEmptyChannel) {
 		t.Fatalf("Start() error = %v, want %v", err, ErrEmptyChannel)
@@ -81,7 +81,7 @@ func TestNotifyDispatcherStartReturnsInitialQueryError(t *testing.T) {
 	dispatcher := NewNotifyDispatcher(
 		"",
 		"worker_events",
-		openTestDB(t),
+		newMockDB(),
 		&mockPositionQuerier{positions: []int64{0}, errors: []error{errors.New("latest position failed")}},
 		store.NoOpLogger{},
 	)
@@ -96,7 +96,7 @@ func TestNotifyDispatcherStartReturnsInitialQueryError(t *testing.T) {
 }
 
 func TestNotifyDispatcherReconcileDoesNotWakeWhenPositionUnchanged(t *testing.T) {
-	dispatcher := NewNotifyDispatcher("", "worker_events", openTestDB(t), &mockPositionQuerier{positions: []int64{5}}, store.NoOpLogger{})
+	dispatcher := NewNotifyDispatcher("", "worker_events", newMockDB(), &mockPositionQuerier{positions: []int64{5}}, store.NoOpLogger{})
 	dispatcher.lastPos = 5
 
 	ch := dispatcher.WakeupChan()
