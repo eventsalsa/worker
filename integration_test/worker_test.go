@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -1057,4 +1058,281 @@ func TestLeaseLeader_ReleaseLease_Success(t *testing.T) {
 	if leaderID != uuid.Nil {
 		t.Fatalf("expected GetLease to return uuid.Nil, got %s", leaderID)
 	}
+}
+
+func TestWorker_SplitBrain_OwnershipLost(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
+	
+	// 1. Start worker-2 first, which will become leader but holds no consumers.
+	worker2 := startTestWorker(t, "worker-2", nil, defaultWorkerOptions()...)
+
+	// 2. Start worker-1 with a consumer. Worker-2 (leader) will assign the consumer to worker-1.
+	consumer := newTestConsumer("consumer-split-brain", "worker-1", nil)
+	worker1 := startTestWorker(t, "worker-1", []*testConsumer{consumer}, defaultWorkerOptions()...)
+
+	// Wait for consumer assignment to worker-1
+	waitForErr(t, defaultWaitTimeout, func() error {
+		assignments := getAssignments(t, controlDB)
+		if len(assignments) != 1 || !assignments[0].Assigned || assignments[0].WorkerID != worker1.worker.ID() {
+			return fmt.Errorf("consumer not assigned to worker-1 yet")
+		}
+		return nil
+	})
+
+	// Append first event
+	appended := appendTestEvents(t, controlDB, eventStore, 1, "Invoice")
+	latest := appended[len(appended)-1].GlobalPosition
+
+	// Verify worker-1 processes first event
+	waitForErr(t, defaultWaitTimeout, func() error {
+		rows := getHandledRows(t, controlDB, consumer.Name())
+		if len(rows) != 1 || rows[0].GlobalPosition != latest {
+			return fmt.Errorf("handled rows=%v want position %d", rows, latest)
+		}
+		return nil
+	})
+
+	// Delete worker-1's registration node row.
+	// This prevents the leader from re-assigning it back to worker-1 when rebalancing.
+	_, err := controlDB.Exec(context.Background(), "DELETE FROM worker_nodes WHERE worker_id = $1", worker1.worker.ID())
+	if err != nil {
+		t.Fatalf("failed to delete worker-1 registration: %v", err)
+	}
+
+	// Manually reassign ownership in the database to worker-2
+	assignConsumerToWorker(t, controlDB, consumer.Name(), worker2.worker.ID())
+
+	// Append second event
+	moreAppended := appendTestEvents(t, controlDB, eventStore, 1, "Invoice")
+	moreLatest := moreAppended[len(moreAppended)-1].GlobalPosition
+
+	// Verify that worker-1 does NOT process the second event because it lost ownership
+	time.Sleep(1200 * time.Millisecond)
+	rows := getHandledRows(t, controlDB, consumer.Name())
+	if len(rows) != 1 {
+		t.Fatalf("expected handled rows to stay at 1, but got %d (worker-1 processed event after losing ownership)", len(rows))
+	}
+	checkpoint := getCheckpoint(t, controlDB, consumer.Name())
+	if checkpoint != latest {
+		t.Fatalf("expected checkpoint to stay at %d, but got %d (moreLatest=%d)", latest, checkpoint, moreLatest)
+	}
+
+	worker1.stop(t)
+	worker2.stop(t)
+}
+
+func TestLeaderFailover_AdvisoryLock_UncleanCrash(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	options := append(defaultWorkerOptions(), workerpkg.WithLeaderStrategy(workerpkg.LeaderStrategyAdvisory))
+
+	// Start worker-1 (becomes leader)
+	worker1 := startTestWorker(t, "worker-1", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-1", nil),
+	}, options...)
+
+	// Start worker-2 (standby)
+	worker2 := startTestWorker(t, "worker-2", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-2", nil),
+	}, options...)
+
+	// Wait for worker-1 to be registered as leader
+	waitForErr(t, defaultWaitTimeout, func() error {
+		counts := assignedConsumerCounts(getAssignments(t, controlDB))
+		if counts[worker1.worker.ID()] != 1 {
+			return fmt.Errorf("worker-1 assignments=%v want 1", counts)
+		}
+		return nil
+	})
+
+	// Retrieve the pg backend PID holding the advisory lock
+	var pid int
+	err := controlDB.QueryRow(context.Background(), `
+		SELECT pid FROM pg_locks 
+		WHERE locktype = 'advisory' 
+		  AND classid = 1685110 AND objid = 407961287
+		LIMIT 1
+	`).Scan(&pid)
+	if err != nil {
+		t.Fatalf("failed to query advisory lock pid: %v", err)
+	}
+
+	// Terminate the database session of worker-1's leader connection (unclean crash)
+	_, err = controlDB.Exec(context.Background(), "SELECT pg_terminate_backend($1)", pid)
+	if err != nil {
+		t.Fatalf("failed to terminate leader backend session: %v", err)
+	}
+
+	// Cancel worker1's context to simulate the process dying
+	worker1.cancel()
+
+	// Verify worker-2 takes over leadership and assignments
+	waitForErr(t, defaultWaitTimeout, func() error {
+		counts := assignedConsumerCounts(getAssignments(t, controlDB))
+		if counts[worker2.worker.ID()] != 1 || len(counts) != 1 {
+			return fmt.Errorf("post-crash assignments=%v want worker-2 => 1", counts)
+		}
+		return nil
+	})
+
+	worker1.stop(t)
+	worker2.stop(t)
+}
+
+func TestLeaseLeader_HeartbeatRenewalHiccupAndSelfDemotion(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	options := append(defaultWorkerOptions(),
+		workerpkg.WithLeaderStrategy(workerpkg.LeaderStrategyLease),
+		workerpkg.WithHeartbeatInterval(100*time.Millisecond),
+		workerpkg.WithHeartbeatTimeout(800*time.Millisecond),
+	)
+
+	// Start worker-1 (becomes leader)
+	worker1 := startTestWorker(t, "worker-1", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-1", nil),
+	}, options...)
+
+	// Wait for worker-1 to become leader
+	waitForErr(t, defaultWaitTimeout, func() error {
+		leaderID, _, err := workerpostgres.GetLease(context.Background(), controlDB, workerpostgres.DefaultLeaderElectionTable)
+		if err != nil {
+			return err
+		}
+		if leaderID != worker1.worker.ID() {
+			return fmt.Errorf("expected worker-1 to be leader")
+		}
+		return nil
+	})
+
+	// Start worker-2 (standby)
+	worker2 := startTestWorker(t, "worker-2", []*testConsumer{
+		newTestConsumer("consumer-1", "worker-2", nil),
+	}, options...)
+
+	// Force-delete worker-1 node row. This will cause lease renewal updates to fail due to foreign key constraint violation.
+	_, err := controlDB.Exec(context.Background(), "DELETE FROM worker_nodes WHERE worker_id = $1", worker1.worker.ID())
+	if err != nil {
+		t.Fatalf("failed to delete worker-1: %v", err)
+	}
+
+	// Verify that worker-2 takes over as leader after the HeartbeatTimeout has elapsed
+	waitForErr(t, 2*time.Second, func() error {
+		leaderID, _, err := workerpostgres.GetLease(context.Background(), controlDB, workerpostgres.DefaultLeaderElectionTable)
+		if err != nil {
+			return err
+		}
+		if leaderID != worker2.worker.ID() {
+			return fmt.Errorf("expected worker-2 to take over leadership, got %s", leaderID)
+		}
+		return nil
+	})
+
+	worker1.stop(t)
+	worker2.stop(t)
+}
+
+func TestDispatcher_NotifyDispatcher_Reconnection(t *testing.T) {
+	controlDB := openTestDB(t)
+	defer controlDB.Close()
+	setupSchema(t, controlDB)
+	defer cleanupTables(t, controlDB)
+
+	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
+	consumer := newTestConsumer("consumer-notify-reconnect", "worker-1", nil)
+
+	// Construct connection string for notifications
+	host := os.Getenv("POSTGRES_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("POSTGRES_PORT")
+	if port == "" {
+		port = "5432"
+	}
+	user := os.Getenv("POSTGRES_USER")
+	if user == "" {
+		user = "postgres"
+	}
+	password := os.Getenv("POSTGRES_PASSWORD")
+	if password == "" {
+		password = "postgres"
+	}
+	dbName := os.Getenv("POSTGRES_DB")
+	if dbName == "" {
+		dbName = "eventsalsa_worker_test"
+	}
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, password, host, port, dbName)
+
+	options := append(defaultWorkerOptions(),
+		workerpkg.WithDispatcherStrategy(workerpkg.DispatcherStrategyNotify),
+		workerpkg.WithNotifyConnectionString(connStr),
+		workerpkg.WithPollInterval(5*time.Second),
+		workerpkg.WithMaxPollInterval(5*time.Second),
+	)
+
+	// Start worker-1
+	worker1 := startTestWorker(t, "worker-1", []*testConsumer{consumer}, options...)
+
+	// Wait for consumer assignment
+	waitForErr(t, defaultWaitTimeout, func() error {
+		assignments := getAssignments(t, controlDB)
+		if len(assignments) != 1 || !assignments[0].Assigned || assignments[0].WorkerID != worker1.worker.ID() {
+			return fmt.Errorf("consumer not assigned yet")
+		}
+		return nil
+	})
+
+	// Find the database session PID of the NotifyDispatcher listener
+	var pid int
+	waitForErr(t, defaultWaitTimeout, func() error {
+		err := controlDB.QueryRow(context.Background(), `
+			SELECT pid FROM pg_stat_activity 
+			WHERE query LIKE 'LISTEN%' AND pid <> pg_backend_pid() 
+			LIMIT 1
+		`).Scan(&pid)
+		return err
+	})
+
+	// Terminate the listener backend session to simulate connection drop
+	_, err := controlDB.Exec(context.Background(), "SELECT pg_terminate_backend($1)", pid)
+	if err != nil {
+		t.Fatalf("failed to terminate listener connection: %v", err)
+	}
+
+	// Wait for the NotifyDispatcher to detect and reconnect (1.5 seconds)
+	time.Sleep(1500 * time.Millisecond)
+
+	// Append event and verify wakeup occurs promptly (well before the 5s polling interval)
+	start := time.Now()
+	appended := appendTestEvents(t, controlDB, eventStore, 1, "Wakeup")
+	latest := appended[len(appended)-1].GlobalPosition
+
+	waitForErr(t, 2*time.Second, func() error {
+		rows := getHandledRows(t, controlDB, consumer.Name())
+		if len(rows) != 1 {
+			return fmt.Errorf("consumer handled %d rows, want 1", len(rows))
+		}
+		if checkpoint := getCheckpoint(t, controlDB, consumer.Name()); checkpoint != latest {
+			return fmt.Errorf("checkpoint=%d want %d", checkpoint, latest)
+		}
+		return nil
+	})
+
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Fatalf("dispatcher reconnection wakeup took %s; expected prompt wakeup after reconnection", elapsed)
+	}
+
+	worker1.stop(t)
 }
