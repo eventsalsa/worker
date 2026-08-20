@@ -2,7 +2,7 @@
 
 ## Summary of Changes
 
-This change transitions the integration test suite from manual Docker Compose-managed PostgreSQL services to automated, ephemeral PostgreSQL containers managed by `testcontainers-go` (`github.com/testcontainers/testcontainers-go/modules/postgres`). In addition, it fixes a non-deterministic failure in `TestWorker_SplitBrain_OwnershipLost`.
+This change transitions the integration test suite from manual Docker Compose-managed PostgreSQL services to automated, ephemeral PostgreSQL containers managed by `testcontainers-go` (`github.com/testcontainers/testcontainers-go/modules/postgres`). In addition, it fixes a non-deterministic failure in `TestWorker_SplitBrain_OwnershipLost` and pins GitHub Actions in `ci.yml` to their corresponding major-version commit SHAs.
 
 ### Key Modifications
 
@@ -18,7 +18,7 @@ This change transitions the integration test suite from manual Docker Compose-ma
 3. **CI / Automation & Build Configuration**:
    - Deleted [docker-compose.yml](docker-compose.yml).
    - Updated [.github/workflows/ci.yml](.github/workflows/ci.yml) to remove the `services.postgres` container and static environment variables, letting Testcontainers run directly against Docker in the runner.
-   - Pinned all GitHub Actions across all workflows (`.github/workflows/ci.yml` and `.github/workflows/release.yml`) to verified immutable commit SHAs with version comments.
+   - Pinned all GitHub Actions in `.github/workflows/ci.yml` (`actions/checkout@v5.1.0`, `actions/setup-go@v5.6.0`, `golangci/golangci-lint-action@v9.3.0`) to verified immutable commit SHAs with version comments (keeping `release.yml` pinned as already configured).
    - Updated [Makefile](Makefile) to point `test-integration` directly to `go test -p 1 -v -tags=integration ./...` and aliased `test-integration-local`.
    - Updated [README.md](README.md) documentation to reflect testcontainers-based integration testing.
 
