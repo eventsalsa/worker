@@ -20,11 +20,60 @@ import (
 	"github.com/eventsalsa/store/consumer"
 	storemigrations "github.com/eventsalsa/store/migrations"
 	storepostgres "github.com/eventsalsa/store/postgres"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	workerpkg "github.com/eventsalsa/worker"
 	workermigrations "github.com/eventsalsa/worker/migrations"
 	workerpostgres "github.com/eventsalsa/worker/postgres"
 )
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+
+	if os.Getenv("TESTCONTAINERS") == "false" {
+		os.Exit(m.Run())
+	}
+
+	pgContainer, err := postgres.Run(ctx,
+		"postgres:16-alpine",
+		postgres.WithDatabase("eventsalsa_worker_test"),
+		postgres.WithUsername("postgres"),
+		postgres.WithPassword("postgres"),
+		postgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start postgres testcontainer: %v\n", err)
+		os.Exit(1)
+	}
+
+	host, err := pgContainer.Host(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get postgres container host: %v\n", err)
+		_ = pgContainer.Terminate(ctx)
+		os.Exit(1)
+	}
+
+	port, err := pgContainer.MappedPort(ctx, "5432/tcp")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get postgres container port: %v\n", err)
+		_ = pgContainer.Terminate(ctx)
+		os.Exit(1)
+	}
+
+	_ = os.Setenv("POSTGRES_HOST", host)
+	_ = os.Setenv("POSTGRES_PORT", port.Port())
+	_ = os.Setenv("POSTGRES_USER", "postgres")
+	_ = os.Setenv("POSTGRES_PASSWORD", "postgres")
+	_ = os.Setenv("POSTGRES_DB", "eventsalsa_worker_test")
+
+	code := m.Run()
+
+	if err := pgContainer.Terminate(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to terminate postgres testcontainer: %v\n", err)
+	}
+
+	os.Exit(code)
+}
 
 const (
 	testWaitInterval      = 50 * time.Millisecond

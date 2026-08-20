@@ -1067,11 +1067,8 @@ func TestWorker_SplitBrain_OwnershipLost(t *testing.T) {
 	defer cleanupTables(t, controlDB)
 
 	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
-	
-	// 1. Start worker-2 first, which will become leader but holds no consumers.
-	worker2 := startTestWorker(t, "worker-2", nil, defaultWorkerOptions()...)
 
-	// 2. Start worker-1 with a consumer. Worker-2 (leader) will assign the consumer to worker-1.
+	// 1. Start worker-1 with a consumer. Worker-1 will become leader and assign the consumer to itself.
 	consumer := newTestConsumer("consumer-split-brain", "worker-1", nil)
 	worker1 := startTestWorker(t, "worker-1", []*testConsumer{consumer}, defaultWorkerOptions()...)
 
@@ -1098,14 +1095,16 @@ func TestWorker_SplitBrain_OwnershipLost(t *testing.T) {
 	})
 
 	// Delete worker-1's registration node row.
-	// This prevents the leader from re-assigning it back to worker-1 when rebalancing.
+	// This simulates worker-1 being considered dead or dropped by the cluster.
 	_, err := controlDB.Exec(context.Background(), "DELETE FROM worker_nodes WHERE worker_id = $1", worker1.worker.ID())
 	if err != nil {
 		t.Fatalf("failed to delete worker-1 registration: %v", err)
 	}
 
-	// Manually reassign ownership in the database to worker-2
-	assignConsumerToWorker(t, controlDB, consumer.Name(), worker2.worker.ID())
+	// Manually reassign ownership in the database to a different worker ID
+	newWorkerID := uuid.New()
+	insertWorkerRow(t, controlDB, newWorkerID, time.Now())
+	assignConsumerToWorker(t, controlDB, consumer.Name(), newWorkerID)
 
 	// Append second event
 	moreAppended := appendTestEvents(t, controlDB, eventStore, 1, "Invoice")
@@ -1123,7 +1122,6 @@ func TestWorker_SplitBrain_OwnershipLost(t *testing.T) {
 	}
 
 	worker1.stop(t)
-	worker2.stop(t)
 }
 
 func TestLeaderFailover_AdvisoryLock_UncleanCrash(t *testing.T) {
