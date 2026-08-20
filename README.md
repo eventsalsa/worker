@@ -398,19 +398,13 @@ cd worker
 go mod download
 ```
 
-### Start PostgreSQL locally
-
-```bash
-docker compose up -d
-```
-
 ### Common commands
 
 ```bash
 make build
 make test
 make lint
-make test-integration-local
+make test-integration
 ```
 
 ### Make targets
@@ -420,25 +414,21 @@ make test-integration-local
 | `make help` | Show available targets |
 | `make test` | Run the default test suite |
 | `make test-unit` | Run unit tests with race detection and coverage |
-| `make test-integration` | Run integration tests against an existing PostgreSQL instance |
-| `make test-integration-local` | Start PostgreSQL with Docker Compose, run integration tests, then tear it down |
+| `make test-integration` | Run integration tests (automatically manages PostgreSQL via testcontainers-go) |
+| `make test-integration-local` | Alias for `test-integration` |
 | `make lint` | Run `golangci-lint` |
 | `make fmt` | Run `gofmt` and `goimports` |
 | `make build` | Build all packages |
+| `make check` | Run all checks (lint, unit tests, integration tests) |
 
-### Integration test environment variables
+### Integration testing
 
-`make test-integration` expects a running PostgreSQL instance and reads these variables:
+Integration tests automatically provision and manage ephemeral PostgreSQL instances using `testcontainers-go` (requires Docker running locally).
 
-- `POSTGRES_HOST` (default: `localhost`)
-- `POSTGRES_PORT` (default: `5432`)
-- `POSTGRES_USER` (default: `postgres`)
-- `POSTGRES_PASSWORD` (default: `postgres`)
-- `POSTGRES_DB` (default: `eventsalsa_worker_test`)
-
-Example:
+To run against a pre-existing external PostgreSQL instance instead of using testcontainers, disable testcontainers and supply the connection variables:
 
 ```bash
+TESTCONTAINERS=false \
 POSTGRES_HOST=localhost \
 POSTGRES_PORT=5432 \
 POSTGRES_USER=postgres \

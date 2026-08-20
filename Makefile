@@ -6,26 +6,17 @@ help: ## Show this help message
 	@echo 'Available targets:'
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-check: lint test test-integration-local ## Run all checks (lint, unit tests, integration tests)
+check: lint test test-integration ## Run all checks (lint, unit tests, integration tests)
 
 test: test-unit ## Run all tests
 
 test-unit: ## Run unit tests
 	go test -v -race -coverprofile=coverage.out ./...
 
-test-integration: ## Run integration tests (requires PostgreSQL)
+test-integration: ## Run integration tests (uses testcontainers-go)
 	go test -p 1 -v -tags=integration ./...
 
-test-integration-local: ## Start PostgreSQL and run integration tests locally
-	docker compose up -d
-	@until docker compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; do \
-		sleep 1; \
-	done
-	@POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=eventsalsa_worker_test \
-	go test -p 1 -v -tags=integration ./...; \
-	status=$$?; \
-	docker compose down; \
-	exit $$status
+test-integration-local: test-integration ## Run integration tests locally (alias for test-integration)
 
 lint: ## Run linter
 	golangci-lint run --timeout=5m
