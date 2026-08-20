@@ -46,8 +46,8 @@ func TestWorker_SingleWorkerMultipleConsumers(t *testing.T) {
 	})
 
 	appended := appendTestEventBatches(t, controlDB, eventStore,
-		testEventBatch{AggregateType: "Account", Count: 3},
-		testEventBatch{AggregateType: "Order", Count: 2},
+		testEventBatch{StreamType: "Account", Count: 3},
+		testEventBatch{StreamType: "Order", Count: 2},
 	)
 	latest := appended[len(appended)-1].GlobalPosition
 
@@ -98,8 +98,8 @@ func TestRebalance_ScaleUp_WorkersReassignWithoutGapsOrDuplication(t *testing.T)
 	})
 
 	initial := appendTestEventBatches(t, controlDB, eventStore,
-		testEventBatch{AggregateType: "Account", Count: 3},
-		testEventBatch{AggregateType: "Order", Count: 2},
+		testEventBatch{StreamType: "Account", Count: 3},
+		testEventBatch{StreamType: "Order", Count: 2},
 	)
 	initialLatest := initial[len(initial)-1].GlobalPosition
 
@@ -436,7 +436,7 @@ func TestGapHandling_LowerPositionCommitsLateBeforeThreshold_NoSkip(t *testing.T
 		return nil
 	})
 
-	held := beginControlledAppend(t, controlDB, eventStore, testEventBatch{AggregateType: "Invoice", Count: 1})
+	held := beginControlledAppend(t, controlDB, eventStore, testEventBatch{StreamType: "Invoice", Count: 1})
 	gapPosition := held.events[0].GlobalPosition
 	later := appendTestEvents(t, controlDB, eventStore, 3, "Invoice")
 	latest := later[len(later)-1].GlobalPosition
@@ -504,7 +504,7 @@ func TestGapHandling_StaleGapAfterThreshold_AdvancesBySafeHarbor(t *testing.T) {
 		return nil
 	})
 
-	held := beginControlledAppend(t, controlDB, eventStore, testEventBatch{AggregateType: "Invoice", Count: 1})
+	held := beginControlledAppend(t, controlDB, eventStore, testEventBatch{StreamType: "Invoice", Count: 1})
 	later := appendTestEvents(t, controlDB, eventStore, 4, "Invoice")
 	expectedSkipTo := later[len(later)-2].GlobalPosition
 	expectedHighestVisible := later[len(later)-1].GlobalPosition
@@ -578,7 +578,7 @@ func TestGapHandling_StaleGapAfterThreshold_AdvancesWithSparseVisibleWindowUnder
 		return nil
 	})
 
-	held := beginControlledAppend(t, controlDB, eventStore, testEventBatch{AggregateType: "Invoice", Count: 1})
+	held := beginControlledAppend(t, controlDB, eventStore, testEventBatch{StreamType: "Invoice", Count: 1})
 	later := appendTestEvents(t, controlDB, eventStore, 1, "Invoice")
 	expectedSkipTo := later[0].GlobalPosition
 

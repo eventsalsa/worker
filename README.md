@@ -108,7 +108,7 @@ func (p *AccountProjection) Name() string {
     return "account_projection"
 }
 
-func (p *AccountProjection) AggregateTypes() []string {
+func (p *AccountProjection) StreamTypes() []string {
     return []string{"Account"}
 }
 
@@ -268,7 +268,7 @@ type Consumer interface {
 
 type ScopedConsumer interface {
     Consumer
-    AggregateTypes() []string
+    StreamTypes() []string
 }
 ```
 

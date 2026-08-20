@@ -969,7 +969,7 @@ func (w *Worker) processProbedBatchAttempt(
 		return prepared, nil
 	}
 
-	relevantEvents := filterHandledEvents(probe.rows, consumerAggregateTypes(registeredConsumer), probe.targetCheckpoint)
+	relevantEvents := filterHandledEvents(probe.rows, consumerStreamTypes(registeredConsumer), probe.targetCheckpoint)
 	if err := handleRelevantEvents(ctx, tx, registeredConsumer, relevantEvents); err != nil {
 		return processedBatch{}, err
 	}
@@ -1146,24 +1146,24 @@ func (w *Worker) revalidateStaleGapSkip(
 	return nil
 }
 
-func consumerAggregateTypes(registeredConsumer consumer.Consumer) []string {
+func consumerStreamTypes(registeredConsumer consumer.Consumer) []string {
 	scopedConsumer, ok := registeredConsumer.(consumer.ScopedConsumer)
 	if !ok {
 		return nil
 	}
 
-	return scopedConsumer.AggregateTypes()
+	return scopedConsumer.StreamTypes()
 }
 
 func filterHandledEvents(
 	rows []store.PersistedEvent,
-	aggregateTypes []string,
+	streamTypes []string,
 	upperBound int64,
 ) []store.PersistedEvent {
 	filtered := make([]store.PersistedEvent, 0, len(rows))
-	allowed := make(map[string]struct{}, len(aggregateTypes))
-	for _, aggregateType := range aggregateTypes {
-		allowed[aggregateType] = struct{}{}
+	allowed := make(map[string]struct{}, len(streamTypes))
+	for _, streamType := range streamTypes {
+		allowed[streamType] = struct{}{}
 	}
 
 	for i := range rows {
@@ -1171,7 +1171,7 @@ func filterHandledEvents(
 			continue
 		}
 		if len(allowed) > 0 {
-			if _, ok := allowed[rows[i].AggregateType]; !ok {
+			if _, ok := allowed[rows[i].StreamType]; !ok {
 				continue
 			}
 		}
