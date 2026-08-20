@@ -66,7 +66,7 @@ func TestComprehensiveScaleUpAndDown(t *testing.T) {
 		assertBalancedAssignments(t, controlDB, len(activeWorkers), len(consumerNames), workerIDs)
 	}
 
-	runProcessingStep := func(aggregateType string, expectedLabels []string) {
+	runProcessingStep := func(streamType string, expectedLabels []string) {
 		t.Helper()
 
 		cutoff := int64(0)
@@ -74,7 +74,7 @@ func TestComprehensiveScaleUpAndDown(t *testing.T) {
 			cutoff = allPositions[len(allPositions)-1]
 		}
 
-		appended := appendTestEvents(t, controlDB, eventStore, 5, aggregateType)
+		appended := appendTestEvents(t, controlDB, eventStore, 5, streamType)
 		for _, event := range appended {
 			allPositions = append(allPositions, event.GlobalPosition)
 		}

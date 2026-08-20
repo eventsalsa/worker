@@ -82,9 +82,9 @@ const (
 )
 
 type testEventBatch struct {
-	AggregateType string
-	AggregateID   string
-	Count         int
+	StreamType string
+	StreamID   string
+	Count      int
 }
 
 type controlledAppend struct {
@@ -98,10 +98,10 @@ type failurePlan struct {
 }
 
 type testConsumer struct {
-	name           string
-	instanceLabel  string
-	aggregateTypes []string
-	handleErr      error
+	name          string
+	instanceLabel string
+	streamTypes   []string
+	handleErr     error
 
 	mu              sync.Mutex
 	processedEvents []store.PersistedEvent
@@ -112,8 +112,8 @@ type testConsumer struct {
 type testConsumerEventRow struct {
 	ConsumerName   string
 	GlobalPosition int64
-	AggregateType  string
-	AggregateID    string
+	StreamType     string
+	StreamID       string
 	EventType      string
 	HandledBy      string
 	AttemptNo      int
@@ -225,7 +225,7 @@ DROP TABLE IF EXISTS consumer_gap_skips CASCADE;
 DROP TABLE IF EXISTS consumer_checkpoints CASCADE;
 DROP TABLE IF EXISTS consumer_assignments CASCADE;
 DROP TABLE IF EXISTS worker_nodes CASCADE;
-DROP TABLE IF EXISTS aggregate_heads CASCADE;
+DROP TABLE IF EXISTS stream_heads CASCADE;
 DROP TABLE IF EXISTS events CASCADE;
 `)
 	if err != nil {
@@ -249,8 +249,8 @@ DROP TABLE IF EXISTS events CASCADE;
 CREATE TABLE test_consumer_events (
 consumer_name TEXT NOT NULL,
 global_position BIGINT NOT NULL,
-aggregate_type TEXT NOT NULL,
-aggregate_id TEXT NOT NULL,
+stream_type TEXT NOT NULL,
+stream_id TEXT NOT NULL,
 event_type TEXT NOT NULL,
 handled_by TEXT NOT NULL,
 attempt_no INT NOT NULL,
@@ -277,7 +277,7 @@ consumer_gap_skips,
 consumer_checkpoints,
 consumer_assignments,
 worker_nodes,
-aggregate_heads,
+stream_heads,
 events
 RESTART IDENTITY CASCADE
 `); err != nil {
@@ -285,12 +285,12 @@ RESTART IDENTITY CASCADE
 	}
 }
 
-func appendTestEvents(t testing.TB, db *pgxpool.Pool, eventStore *storepostgres.Store, count int, aggregateType string) []store.PersistedEvent {
+func appendTestEvents(t testing.TB, db *pgxpool.Pool, eventStore *storepostgres.Store, count int, streamType string) []store.PersistedEvent {
 	t.Helper()
 
 	return appendTestEventBatches(t, db, eventStore, testEventBatch{
-		AggregateType: aggregateType,
-		Count:         count,
+		StreamType: streamType,
+		Count:      count,
 	})
 }
 
@@ -305,22 +305,22 @@ func appendTestEventBatches(t testing.TB, db *pgxpool.Pool, eventStore *storepos
 			continue
 		}
 
-		aggregateID := batch.AggregateID
-		if aggregateID == "" {
-			aggregateID = uuid.NewString()
+		streamID := batch.StreamID
+		if streamID == "" {
+			streamID = uuid.NewString()
 		}
 
 		events := make([]store.Event, 0, batch.Count)
 		for idx := range batch.Count {
 			events = append(events, store.Event{
-				AggregateType: batch.AggregateType,
-				AggregateID:   aggregateID,
-				EventID:       uuid.New(),
-				EventType:     fmt.Sprintf("%s.event.%d", batch.AggregateType, idx+1),
-				EventVersion:  1,
-				Payload:       []byte(fmt.Sprintf(`{"aggregate_type":%q,"event_number":%d}`, batch.AggregateType, idx+1)),
-				Metadata:      []byte(`{}`),
-				CreatedAt:     time.Now().UTC(),
+				StreamType:   batch.StreamType,
+				StreamID:     streamID,
+				EventID:      uuid.New(),
+				EventType:    fmt.Sprintf("%s.event.%d", batch.StreamType, idx+1),
+				EventVersion: 1,
+				Payload:      []byte(fmt.Sprintf(`{"stream_type":%q,"event_number":%d}`, batch.StreamType, idx+1)),
+				Metadata:     []byte(`{}`),
+				CreatedAt:    time.Now().UTC(),
 			})
 		}
 
@@ -353,22 +353,22 @@ func beginControlledAppend(t testing.TB, db *pgxpool.Pool, eventStore *storepost
 	t.Helper()
 
 	ctx := context.Background()
-	aggregateID := batch.AggregateID
-	if aggregateID == "" {
-		aggregateID = uuid.NewString()
+	streamID := batch.StreamID
+	if streamID == "" {
+		streamID = uuid.NewString()
 	}
 
 	events := make([]store.Event, 0, batch.Count)
 	for idx := range batch.Count {
 		events = append(events, store.Event{
-			AggregateType: batch.AggregateType,
-			AggregateID:   aggregateID,
-			EventID:       uuid.New(),
-			EventType:     fmt.Sprintf("%s.event.%d", batch.AggregateType, idx+1),
-			EventVersion:  1,
-			Payload:       []byte(fmt.Sprintf(`{"aggregate_type":%q,"event_number":%d}`, batch.AggregateType, idx+1)),
-			Metadata:      []byte(`{}`),
-			CreatedAt:     time.Now().UTC(),
+			StreamType:   batch.StreamType,
+			StreamID:     streamID,
+			EventID:      uuid.New(),
+			EventType:    fmt.Sprintf("%s.event.%d", batch.StreamType, idx+1),
+			EventVersion: 1,
+			Payload:      []byte(fmt.Sprintf(`{"stream_type":%q,"event_number":%d}`, batch.StreamType, idx+1)),
+			Metadata:     []byte(`{}`),
+			CreatedAt:    time.Now().UTC(),
 		})
 	}
 
@@ -437,13 +437,13 @@ func waitForErr(t testing.TB, timeout time.Duration, fn func() error) {
 	}
 }
 
-func newTestConsumer(name, instanceLabel string, aggregateTypes []string) *testConsumer {
+func newTestConsumer(name, instanceLabel string, streamTypes []string) *testConsumer {
 	return &testConsumer{
-		name:           name,
-		instanceLabel:  instanceLabel,
-		aggregateTypes: append([]string(nil), aggregateTypes...),
-		attempts:       make(map[int64]int),
-		failures:       make(map[int64]failurePlan),
+		name:          name,
+		instanceLabel: instanceLabel,
+		streamTypes:   append([]string(nil), streamTypes...),
+		attempts:      make(map[int64]int),
+		failures:      make(map[int64]failurePlan),
 	}
 }
 
@@ -451,8 +451,8 @@ func (c *testConsumer) Name() string {
 	return c.name
 }
 
-func (c *testConsumer) AggregateTypes() []string {
-	return append([]string(nil), c.aggregateTypes...)
+func (c *testConsumer) StreamTypes() []string {
+	return append([]string(nil), c.streamTypes...)
 }
 
 func (c *testConsumer) Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error {
@@ -485,13 +485,13 @@ func (c *testConsumer) Handle(ctx context.Context, tx pgx.Tx, event store.Persis
 INSERT INTO test_consumer_events (
 consumer_name,
 global_position,
-aggregate_type,
-aggregate_id,
+stream_type,
+stream_id,
 event_type,
 handled_by,
 attempt_no
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-`, c.name, event.GlobalPosition, event.AggregateType, event.AggregateID, event.EventType, c.instanceLabel, attemptNo)
+`, c.name, event.GlobalPosition, event.StreamType, event.StreamID, event.EventType, c.instanceLabel, attemptNo)
 	if err != nil {
 		return fmt.Errorf("insert test consumer row: %w", err)
 	}
@@ -684,7 +684,7 @@ func getHandledRows(t testing.TB, db *pgxpool.Pool, consumerName string) []testC
 	defer cancel()
 
 	rows, err := db.Query(ctx, `
-SELECT consumer_name, global_position, aggregate_type, aggregate_id, event_type, handled_by, attempt_no
+SELECT consumer_name, global_position, stream_type, stream_id, event_type, handled_by, attempt_no
 FROM test_consumer_events
 WHERE consumer_name = $1
 ORDER BY global_position ASC
@@ -700,8 +700,8 @@ ORDER BY global_position ASC
 		if err := rows.Scan(
 			&row.ConsumerName,
 			&row.GlobalPosition,
-			&row.AggregateType,
-			&row.AggregateID,
+			&row.StreamType,
+			&row.StreamID,
 			&row.EventType,
 			&row.HandledBy,
 			&row.AttemptNo,
@@ -851,10 +851,10 @@ func generateStoreSQL(t testing.TB, outputDir string) []byte {
 	t.Helper()
 
 	config := &storemigrations.Config{
-		OutputFolder:        outputDir,
-		OutputFilename:      "store.sql",
-		EventsTable:         "events",
-		AggregateHeadsTable: "aggregate_heads",
+		OutputFolder:     outputDir,
+		OutputFilename:   "store.sql",
+		EventsTable:      "events",
+		StreamHeadsTable: "stream_heads",
 	}
 	if err := storemigrations.GeneratePostgres(config); err != nil {
 		t.Fatalf("generate store migration: %v", err)

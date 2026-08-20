@@ -89,11 +89,11 @@ func (c *recordingConsumer) Handle(_ context.Context, _ pgx.Tx, event store.Pers
 
 type scopedRecordingConsumer struct {
 	recordingConsumer
-	aggregateTypes []string
+	streamTypes []string
 }
 
-func (c *scopedRecordingConsumer) AggregateTypes() []string {
-	return append([]string(nil), c.aggregateTypes...)
+func (c *scopedRecordingConsumer) StreamTypes() []string {
+	return append([]string(nil), c.streamTypes...)
 }
 
 type testDispatcher struct {
@@ -704,13 +704,13 @@ func TestAssignmentPollInterval(t *testing.T) {
 }
 
 func TestProcessBatchScopedReads(t *testing.T) {
-	makeEvent := func(position int64, aggregateType string) store.PersistedEvent {
+	makeEvent := func(position int64, streamType string) store.PersistedEvent {
 		return store.PersistedEvent{
-			EventID:          uuid.New(),
-			GlobalPosition:   position,
-			AggregateType:    aggregateType,
-			AggregateID:      fmt.Sprintf("%s-%d", aggregateType, position),
-			AggregateVersion: position,
+			EventID:        uuid.New(),
+			GlobalPosition: position,
+			StreamType:     streamType,
+			StreamID:       fmt.Sprintf("%s-%d", streamType, position),
+			StreamVersion:  position,
 		}
 	}
 
@@ -748,7 +748,7 @@ func TestProcessBatchScopedReads(t *testing.T) {
 		}
 		registeredConsumer := &scopedRecordingConsumer{
 			recordingConsumer: recordingConsumer{name: "orders"},
-			aggregateTypes:    []string{"order"},
+			streamTypes:       []string{"order"},
 		}
 		worker := &Worker{
 			id:     workerID,
@@ -808,7 +808,7 @@ func TestProcessBatchScopedReads(t *testing.T) {
 		}
 		registeredConsumer := &scopedRecordingConsumer{
 			recordingConsumer: recordingConsumer{name: "orders"},
-			aggregateTypes:    []string{"order"},
+			streamTypes:       []string{"order"},
 		}
 		worker := &Worker{
 			id:     workerID,
@@ -1059,13 +1059,13 @@ func TestWaitForConsumerDelay(t *testing.T) {
 }
 
 func TestProcessBatch(t *testing.T) {
-	makeEvent := func(position int64, aggregateType string) store.PersistedEvent {
+	makeEvent := func(position int64, streamType string) store.PersistedEvent {
 		return store.PersistedEvent{
-			EventID:          uuid.New(),
-			GlobalPosition:   position,
-			AggregateType:    aggregateType,
-			AggregateID:      fmt.Sprintf("%s-%d", aggregateType, position),
-			AggregateVersion: position,
+			EventID:        uuid.New(),
+			GlobalPosition: position,
+			StreamType:     streamType,
+			StreamID:       fmt.Sprintf("%s-%d", streamType, position),
+			StreamVersion:  position,
 		}
 	}
 
@@ -1233,7 +1233,7 @@ func TestProcessBatch(t *testing.T) {
 		}
 		registeredConsumer := &scopedRecordingConsumer{
 			recordingConsumer: recordingConsumer{name: "orders"},
-			aggregateTypes:    []string{"order"},
+			streamTypes:       []string{"order"},
 		}
 
 		worker := &Worker{
@@ -1256,8 +1256,8 @@ func TestProcessBatch(t *testing.T) {
 		if len(registeredConsumer.handled) != 1 {
 			t.Fatalf("handled events = %d, want 1", len(registeredConsumer.handled))
 		}
-		if registeredConsumer.handled[0].AggregateType != "order" {
-			t.Fatalf("handled aggregate type = %q, want order", registeredConsumer.handled[0].AggregateType)
+		if registeredConsumer.handled[0].StreamType != "order" {
+			t.Fatalf("handled stream type = %q, want order", registeredConsumer.handled[0].StreamType)
 		}
 	})
 
@@ -1590,7 +1590,7 @@ func TestProcessBatch(t *testing.T) {
 		}
 		registeredConsumer := &scopedRecordingConsumer{
 			recordingConsumer: recordingConsumer{name: "users"},
-			aggregateTypes:    []string{"user"},
+			streamTypes:       []string{"user"},
 		}
 		config := DefaultConfig()
 		config.BatchSize = 10
@@ -1818,7 +1818,7 @@ func TestProcessBatch(t *testing.T) {
 		}
 		registeredConsumer := &scopedRecordingConsumer{
 			recordingConsumer: recordingConsumer{name: "users"},
-			aggregateTypes:    []string{"user"},
+			streamTypes:       []string{"user"},
 		}
 		worker := &Worker{
 			id:    workerID,
@@ -1896,7 +1896,7 @@ func TestProcessBatch(t *testing.T) {
 		}
 		registeredConsumer := &scopedRecordingConsumer{
 			recordingConsumer: recordingConsumer{name: "users"},
-			aggregateTypes:    []string{"user"},
+			streamTypes:       []string{"user"},
 		}
 		worker := &Worker{
 			id:    workerID,
@@ -1967,7 +1967,7 @@ func TestProcessBatch(t *testing.T) {
 		}
 		registeredConsumer := &scopedRecordingConsumer{
 			recordingConsumer: recordingConsumer{name: "users"},
-			aggregateTypes:    []string{"user"},
+			streamTypes:       []string{"user"},
 		}
 		worker := &Worker{
 			id:    workerID,
