@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.0](https://github.com/eventsalsa/worker/compare/v0.0.3...v0.1.0) (2026-08-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **worker:** replace aggregate terminology with stream across consumer contracts and event filtering
+
+### Code Refactoring
+
+* **worker:** align with stream terminology and upgrade store to v0.1.0 ([#11](https://github.com/eventsalsa/worker/issues/11)) ([e07b3c9](https://github.com/eventsalsa/worker/commit/e07b3c93f5e389b074a721b169a9d67119cacb9e))
+
 ## v0.0.2
 
 ### Added
