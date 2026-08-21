@@ -98,7 +98,7 @@ func (d *NotifyDispatcher) validate() error {
 	return nil
 }
 
-// WakeupChan returns the wakeup channel shared with consumer goroutines.
+// WakeupChan returns the wakeup channel shared with projection goroutines.
 func (d *NotifyDispatcher) WakeupChan() <-chan struct{} {
 	return d.wakeup.Channel()
 }

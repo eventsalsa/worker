@@ -31,7 +31,7 @@ var (
 	ErrAlreadyRunning = errors.New("dispatcher already running")
 )
 
-// Dispatcher detects new events and broadcasts wakeup signals to consumer goroutines.
+// Dispatcher detects new events and broadcasts wakeup signals to projection goroutines.
 // Implementations must be safe for concurrent use.
 type Dispatcher interface {
 	// Start begins the dispatcher's detection loop. Blocks until ctx is canceled.
@@ -39,7 +39,7 @@ type Dispatcher interface {
 	// with a new one each time new events are detected.
 	Start(ctx context.Context) error
 
-	// WakeupChan returns the current wakeup generation channel. Consumers should call
+	// WakeupChan returns the current wakeup generation channel. Projections should call
 	// WakeupChan each time they enter a select so they observe future broadcasts
 	// after the current generation is closed.
 	WakeupChan() <-chan struct{}
