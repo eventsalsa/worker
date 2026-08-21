@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/eventsalsa/projector/compare/v0.1.0...v0.2.0) (2026-08-21)
+
+
+### Features
+
+* **projector:** rename worker to projector and upgrade to store v0.2.0 ([#13](https://github.com/eventsalsa/projector/issues/13)) ([312f2fe](https://github.com/eventsalsa/projector/commit/312f2fe87d6717ad86f01cd7c34f9580fe4b40ac))
+
 ## [0.1.0](https://github.com/eventsalsa/worker/compare/v0.0.3...v0.1.0) (2026-08-20)
 
 
