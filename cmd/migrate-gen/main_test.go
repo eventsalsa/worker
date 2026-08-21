@@ -28,8 +28,8 @@ func TestRunGeneratesMigrationWithDefaults(t *testing.T) {
 	}
 
 	outputFilename := entries[0].Name()
-	if !regexp.MustCompile(`^\d{14}_init_worker_infrastructure\.sql$`).MatchString(outputFilename) {
-		t.Fatalf("output filename = %q, want timestamped worker migration filename", outputFilename)
+	if !regexp.MustCompile(`^\d{14}_init_projector_infrastructure\.sql$`).MatchString(outputFilename) {
+		t.Fatalf("output filename = %q, want timestamped projector migration filename", outputFilename)
 	}
 
 	content, err := os.ReadFile(filepath.Join(outputDir, outputFilename))
@@ -39,10 +39,11 @@ func TestRunGeneratesMigrationWithDefaults(t *testing.T) {
 
 	sql := string(content)
 	requiredStrings := []string{
-		"CREATE TABLE IF NOT EXISTS worker_nodes",
-		"CREATE TABLE IF NOT EXISTS consumer_assignments",
-		"CREATE TABLE IF NOT EXISTS consumer_checkpoints",
-		"CREATE TABLE IF NOT EXISTS consumer_gap_skips",
+		"CREATE TABLE IF NOT EXISTS projector_instances",
+		"CREATE TABLE IF NOT EXISTS projection_assignments",
+		"CREATE TABLE IF NOT EXISTS projection_checkpoints",
+		"CREATE TABLE IF NOT EXISTS projection_gap_skips",
+		"CREATE TABLE IF NOT EXISTS projector_leader_leases",
 	}
 	for _, required := range requiredStrings {
 		if !strings.Contains(sql, required) {
@@ -61,17 +62,18 @@ func TestRunGeneratesMigrationWithDefaults(t *testing.T) {
 
 func TestRunGeneratesMigrationWithOverrides(t *testing.T) {
 	outputDir := t.TempDir()
-	outputFilename := "002_worker_tables.sql"
+	outputFilename := "002_projector_tables.sql"
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
 	exitCode := run([]string{
 		"-output", outputDir,
 		"-filename", outputFilename,
-		"-worker-nodes-table", "infra.worker_nodes",
-		"-consumer-assignments-table", "infra.consumer_assignments",
-		"-consumer-checkpoints-table", "infra.consumer_checkpoints",
-		"-consumer-gap-skips-table", "infra.consumer_gap_skips",
+		"-projector-instances-table", "infra.projector_instances",
+		"-projection-assignments-table", "infra.projection_assignments",
+		"-projection-checkpoints-table", "infra.projection_checkpoints",
+		"-projection-gap-skips-table", "infra.projection_gap_skips",
+		"-projector-leader-leases-table", "infra.projector_leader_leases",
 	}, &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("run exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
@@ -85,10 +87,11 @@ func TestRunGeneratesMigrationWithOverrides(t *testing.T) {
 	sql := string(content)
 	requiredStrings := []string{
 		"CREATE SCHEMA IF NOT EXISTS infra;",
-		"CREATE TABLE IF NOT EXISTS infra.worker_nodes",
-		"CREATE TABLE IF NOT EXISTS infra.consumer_assignments",
-		"CREATE TABLE IF NOT EXISTS infra.consumer_checkpoints",
-		"CREATE TABLE IF NOT EXISTS infra.consumer_gap_skips",
+		"CREATE TABLE IF NOT EXISTS infra.projector_instances",
+		"CREATE TABLE IF NOT EXISTS infra.projection_assignments",
+		"CREATE TABLE IF NOT EXISTS infra.projection_checkpoints",
+		"CREATE TABLE IF NOT EXISTS infra.projection_gap_skips",
+		"CREATE TABLE IF NOT EXISTS infra.projector_leader_leases",
 	}
 	for _, required := range requiredStrings {
 		if !strings.Contains(sql, required) {

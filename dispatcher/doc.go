@@ -1,7 +1,7 @@
-// Package dispatcher provides wakeup signal dispatchers for consumer goroutines.
+// Package dispatcher provides wakeup signal dispatchers for projection goroutines.
 //
 // A dispatcher is a lightweight optimization that detects when the event store has
-// advanced and nudges worker consumers to poll immediately instead of waiting for
+// advanced and nudges projections to poll immediately instead of waiting for
 // their adaptive polling backoff to expire.
 //
 // Two strategies are provided:

@@ -11,7 +11,7 @@ import (
 )
 
 // NotifyDispatcher listens for PostgreSQL NOTIFY events and emits wakeup signals.
-// It also performs a slower reconciliation poll so that workers still wake up if
+// It also performs a slower reconciliation poll so that instances still wake up if
 // LISTEN/NOTIFY is unavailable or notifications are missed.
 type NotifyDispatcher struct {
 	querier PositionQuerier

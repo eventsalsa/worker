@@ -9,82 +9,82 @@ import (
 )
 
 func TestComputeAssignmentsEvenDistribution(t *testing.T) {
-	workerIDs := []uuid.UUID{
+	instanceIDs := []uuid.UUID{
 		uuid.MustParse("00000000-0000-0000-0000-000000000001"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000002"),
 	}
-	consumerNames := []string{
-		"consumer-10",
-		"consumer-03",
-		"consumer-06",
-		"consumer-04",
-		"consumer-01",
-		"consumer-09",
-		"consumer-05",
-		"consumer-07",
-		"consumer-02",
-		"consumer-08",
+	projectionNames := []string{
+		"projection-10",
+		"projection-03",
+		"projection-06",
+		"projection-04",
+		"projection-01",
+		"projection-09",
+		"projection-05",
+		"projection-07",
+		"projection-02",
+		"projection-08",
 	}
 
-	assignments := ComputeAssignments(consumerNames, workerIDs)
+	assignments := ComputeAssignments(projectionNames, instanceIDs)
 
-	if len(assignments) != len(consumerNames) {
-		t.Fatalf("expected %d assignments, got %d", len(consumerNames), len(assignments))
+	if len(assignments) != len(projectionNames) {
+		t.Fatalf("expected %d assignments, got %d", len(projectionNames), len(assignments))
 	}
 
 	counts := countAssignments(assignments)
-	if counts[workerIDs[0]] != 5 || counts[workerIDs[1]] != 5 {
-		t.Fatalf("expected 5 assignments per worker, got %v", counts)
+	if counts[instanceIDs[0]] != 5 || counts[instanceIDs[1]] != 5 {
+		t.Fatalf("expected 5 assignments per instance, got %v", counts)
 	}
 }
 
 func TestComputeAssignmentsUnevenDistribution(t *testing.T) {
-	workerIDs := []uuid.UUID{
+	instanceIDs := []uuid.UUID{
 		uuid.MustParse("00000000-0000-0000-0000-000000000001"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000002"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000003"),
 	}
-	consumerNames := []string{
-		"consumer-g",
-		"consumer-a",
-		"consumer-e",
-		"consumer-c",
-		"consumer-b",
-		"consumer-d",
-		"consumer-f",
+	projectionNames := []string{
+		"projection-g",
+		"projection-a",
+		"projection-e",
+		"projection-c",
+		"projection-b",
+		"projection-d",
+		"projection-f",
 	}
 
-	assignments := ComputeAssignments(consumerNames, workerIDs)
+	assignments := ComputeAssignments(projectionNames, instanceIDs)
 	counts := countAssignments(assignments)
 
-	got := []int{counts[workerIDs[0]], counts[workerIDs[1]], counts[workerIDs[2]]}
+	got := []int{counts[instanceIDs[0]], counts[instanceIDs[1]], counts[instanceIDs[2]]}
 	want := []int{3, 2, 2}
 	if !slices.Equal(got, want) {
 		t.Fatalf("expected uneven distribution %v, got %v", want, got)
 	}
 }
 
-func TestComputeAssignmentsSingleWorker(t *testing.T) {
-	workerID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	consumerNames := []string{"alpha", "beta", "gamma"}
+func TestComputeAssignmentsSingleInstance(t *testing.T) {
+	instanceID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	projectionNames := []string{"alpha", "beta", "gamma"}
 
-	assignments := ComputeAssignments(consumerNames, []uuid.UUID{workerID})
+	assignments := ComputeAssignments(projectionNames, []uuid.UUID{instanceID})
 
-	for _, consumerName := range consumerNames {
-		if assignments[consumerName] != workerID {
-			t.Fatalf("expected consumer %s to be assigned to %s, got %s", consumerName, workerID, assignments[consumerName])
+	for _, projectionName := range projectionNames {
+		if assignments[projectionName] != instanceID {
+			t.Fatalf("expected projection %s to be assigned to %s, got %s", projectionName, instanceID, assignments[projectionName])
 		}
 	}
 }
 
-func TestComputeAssignmentsNoWorkers(t *testing.T) {
+func TestComputeAssignmentsNoInstances(t *testing.T) {
 	assignments := ComputeAssignments([]string{"alpha", "beta"}, nil)
 	if len(assignments) != 0 {
 		t.Fatalf("expected no assignments, got %v", assignments)
 	}
 }
 
-func TestComputeAssignmentsNoConsumers(t *testing.T) {
+func TestComputeAssignmentsNoProjections(t *testing.T) {
 	assignments := ComputeAssignments(nil, []uuid.UUID{uuid.New()})
 	if len(assignments) != 0 {
 		t.Fatalf("expected no assignments, got %v", assignments)
@@ -92,60 +92,60 @@ func TestComputeAssignmentsNoConsumers(t *testing.T) {
 }
 
 func TestComputeAssignmentsDeterministic(t *testing.T) {
-	workerIDs := []uuid.UUID{
+	instanceIDs := []uuid.UUID{
 		uuid.MustParse("00000000-0000-0000-0000-000000000010"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000001"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000007"),
 	}
-	consumerNames := []string{"gamma", "alpha", "delta", "beta"}
+	projectionNames := []string{"gamma", "alpha", "delta", "beta"}
 
-	first := ComputeAssignments(consumerNames, workerIDs)
-	second := ComputeAssignments(consumerNames, workerIDs)
+	first := ComputeAssignments(projectionNames, instanceIDs)
+	second := ComputeAssignments(projectionNames, instanceIDs)
 
 	if len(first) != len(second) {
 		t.Fatalf("expected same assignment length, got %d and %d", len(first), len(second))
 	}
 
-	for consumerName, firstWorkerID := range first {
-		if second[consumerName] != firstWorkerID {
-			t.Fatalf("expected deterministic assignment for %s, got %s then %s", consumerName, firstWorkerID, second[consumerName])
+	for projectionName, firstInstanceID := range first {
+		if second[projectionName] != firstInstanceID {
+			t.Fatalf("expected deterministic assignment for %s, got %s then %s", projectionName, firstInstanceID, second[projectionName])
 		}
 	}
 }
 
 func TestNeedsRebalance(t *testing.T) {
-	workerA := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	workerB := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	instanceA := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	instanceB := uuid.MustParse("00000000-0000-0000-0000-000000000002")
 
 	t.Run("returns false when assignments already match ideal state", func(t *testing.T) {
-		current := []ConsumerAssignment{
-			{ConsumerName: "alpha", WorkerID: workerA, Assigned: true},
-			{ConsumerName: "beta", WorkerID: workerB, Assigned: true},
-			{ConsumerName: "delta", WorkerID: workerA, Assigned: true},
-			{ConsumerName: "gamma", WorkerID: workerB, Assigned: true},
+		current := []ProjectionAssignment{
+			{ProjectionName: "alpha", InstanceID: instanceA, Assigned: true},
+			{ProjectionName: "beta", InstanceID: instanceB, Assigned: true},
+			{ProjectionName: "delta", InstanceID: instanceA, Assigned: true},
+			{ProjectionName: "gamma", InstanceID: instanceB, Assigned: true},
 		}
 
-		if NeedsRebalance(current, []uuid.UUID{workerA, workerB}) {
+		if NeedsRebalance(current, []uuid.UUID{instanceA, instanceB}) {
 			t.Fatal("expected rebalance to be unnecessary")
 		}
 	})
 
-	t.Run("returns true when worker topology changes", func(t *testing.T) {
-		current := []ConsumerAssignment{
-			{ConsumerName: "alpha", WorkerID: workerA, Assigned: true},
-			{ConsumerName: "beta", WorkerID: workerA, Assigned: true},
-			{ConsumerName: "gamma", WorkerID: workerA, Assigned: true},
-			{ConsumerName: "delta", WorkerID: workerA, Assigned: true},
+	t.Run("returns true when instance topology changes", func(t *testing.T) {
+		current := []ProjectionAssignment{
+			{ProjectionName: "alpha", InstanceID: instanceA, Assigned: true},
+			{ProjectionName: "beta", InstanceID: instanceA, Assigned: true},
+			{ProjectionName: "gamma", InstanceID: instanceA, Assigned: true},
+			{ProjectionName: "delta", InstanceID: instanceA, Assigned: true},
 		}
 
-		if !NeedsRebalance(current, []uuid.UUID{workerA, workerB}) {
-			t.Fatal("expected rebalance to be required after adding a live worker")
+		if !NeedsRebalance(current, []uuid.UUID{instanceA, instanceB}) {
+			t.Fatal("expected rebalance to be required after adding a live instance")
 		}
 	})
 
-	t.Run("returns true when no workers are live but assignments remain", func(t *testing.T) {
-		current := []ConsumerAssignment{
-			{ConsumerName: "alpha", WorkerID: workerA, Assigned: true},
+	t.Run("returns true when no instances are live but assignments remain", func(t *testing.T) {
+		current := []ProjectionAssignment{
+			{ProjectionName: "alpha", InstanceID: instanceA, Assigned: true},
 		}
 
 		if !NeedsRebalance(current, nil) {
@@ -153,63 +153,63 @@ func TestNeedsRebalance(t *testing.T) {
 		}
 	})
 
-	t.Run("returns false when no workers are live and consumers are already unassigned", func(t *testing.T) {
-		current := []ConsumerAssignment{
-			{ConsumerName: "alpha"},
-			{ConsumerName: "beta"},
+	t.Run("returns false when no instances are live and projections are already unassigned", func(t *testing.T) {
+		current := []ProjectionAssignment{
+			{ProjectionName: "alpha"},
+			{ProjectionName: "beta"},
 		}
 
 		if NeedsRebalance(current, nil) {
-			t.Fatal("expected rebalance to be unnecessary when consumers are already unassigned")
+			t.Fatal("expected rebalance to be unnecessary when projections are already unassigned")
 		}
 	})
 }
 
-func TestComputeAssignmentsDuplicateWorkersRemainDeterministic(t *testing.T) {
-	workerA := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	workerB := uuid.MustParse("00000000-0000-0000-0000-000000000002")
-	consumerNames := []string{"gamma", "alpha", "zeta", "beta", "epsilon", "delta"}
-	workerIDs := []uuid.UUID{workerB, workerA, workerA}
+func TestComputeAssignmentsDuplicateInstancesRemainDeterministic(t *testing.T) {
+	instanceA := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	instanceB := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	projectionNames := []string{"gamma", "alpha", "zeta", "beta", "epsilon", "delta"}
+	instanceIDs := []uuid.UUID{instanceB, instanceA, instanceA}
 
-	first := ComputeAssignments(consumerNames, workerIDs)
-	second := ComputeAssignments([]string{"delta", "epsilon", "beta", "zeta", "alpha", "gamma"}, []uuid.UUID{workerA, workerB, workerA})
+	first := ComputeAssignments(projectionNames, instanceIDs)
+	second := ComputeAssignments([]string{"delta", "epsilon", "beta", "zeta", "alpha", "gamma"}, []uuid.UUID{instanceA, instanceB, instanceA})
 
-	if len(first) != len(consumerNames) {
-		t.Fatalf("expected %d assignments, got %d", len(consumerNames), len(first))
+	if len(first) != len(projectionNames) {
+		t.Fatalf("expected %d assignments, got %d", len(projectionNames), len(first))
 	}
 
-	for consumerName, assignedWorker := range first {
-		if second[consumerName] != assignedWorker {
-			t.Fatalf("assignment for %s = %s then %s, want deterministic result", consumerName, assignedWorker, second[consumerName])
+	for projectionName, assignedInstance := range first {
+		if second[projectionName] != assignedInstance {
+			t.Fatalf("assignment for %s = %s then %s, want deterministic result", projectionName, assignedInstance, second[projectionName])
 		}
 	}
 
 	counts := countAssignments(first)
-	if counts[workerA] != 4 || counts[workerB] != 2 {
-		t.Fatalf("assignment counts = %v, want workerA=4 workerB=2", counts)
+	if counts[instanceA] != 4 || counts[instanceB] != 2 {
+		t.Fatalf("assignment counts = %v, want instanceA=4 instanceB=2", counts)
 	}
 }
 
-func TestComputeAssignmentsLargeConsumerSetRemainsBalanced(t *testing.T) {
-	workerIDs := []uuid.UUID{
+func TestComputeAssignmentsLargeProjectionSetRemainsBalanced(t *testing.T) {
+	instanceIDs := []uuid.UUID{
 		uuid.MustParse("00000000-0000-0000-0000-000000000001"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000002"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000003"),
 		uuid.MustParse("00000000-0000-0000-0000-000000000004"),
 	}
 
-	consumerNames := make([]string, 0, 101)
+	projectionNames := make([]string, 0, 101)
 	for i := 100; i >= 0; i-- {
-		consumerNames = append(consumerNames, fmt.Sprintf("consumer-%03d", i))
+		projectionNames = append(projectionNames, fmt.Sprintf("projection-%03d", i))
 	}
 
-	assignments := ComputeAssignments(consumerNames, workerIDs)
-	if len(assignments) != len(consumerNames) {
-		t.Fatalf("expected %d assignments, got %d", len(consumerNames), len(assignments))
+	assignments := ComputeAssignments(projectionNames, instanceIDs)
+	if len(assignments) != len(projectionNames) {
+		t.Fatalf("expected %d assignments, got %d", len(projectionNames), len(assignments))
 	}
 
 	counts := countAssignments(assignments)
-	got := []int{counts[workerIDs[0]], counts[workerIDs[1]], counts[workerIDs[2]], counts[workerIDs[3]]}
+	got := []int{counts[instanceIDs[0]], counts[instanceIDs[1]], counts[instanceIDs[2]], counts[instanceIDs[3]]}
 	want := []int{26, 25, 25, 25}
 	if !slices.Equal(got, want) {
 		t.Fatalf("assignment counts = %v, want %v", got, want)
@@ -231,8 +231,8 @@ func TestComputeAssignmentsLargeConsumerSetRemainsBalanced(t *testing.T) {
 
 func countAssignments(assignments map[string]uuid.UUID) map[uuid.UUID]int {
 	counts := make(map[uuid.UUID]int, len(assignments))
-	for _, workerID := range assignments {
-		counts[workerID]++
+	for _, instanceID := range assignments {
+		counts[instanceID]++
 	}
 
 	return counts

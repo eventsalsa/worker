@@ -1,4 +1,4 @@
-package worker
+package projector
 
 import (
 	"context"
@@ -12,17 +12,16 @@ import (
 	"time"
 
 	"github.com/eventsalsa/store"
-	"github.com/eventsalsa/store/consumer"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/eventsalsa/worker/dispatcher"
-	workerpostgres "github.com/eventsalsa/worker/postgres"
+	"github.com/eventsalsa/projector/dispatcher"
+	projectorpostgres "github.com/eventsalsa/projector/postgres"
 )
 
-type stubWorkerStore struct {
+type stubProjectorStore struct {
 	readErr       error
 	positionError error
 	events        []store.PersistedEvent
@@ -33,7 +32,7 @@ type stubWorkerStore struct {
 	lastLimit     int
 }
 
-func (s *stubWorkerStore) ReadEvents(_ context.Context, _ pgx.Tx, fromPosition int64, limit int) ([]store.PersistedEvent, error) {
+func (s *stubProjectorStore) ReadEvents(_ context.Context, _ pgx.Tx, fromPosition int64, limit int) ([]store.PersistedEvent, error) {
 	s.readCalls++
 	s.lastFrom = fromPosition
 	s.lastLimit = limit
@@ -58,26 +57,26 @@ func (s *stubWorkerStore) ReadEvents(_ context.Context, _ pgx.Tx, fromPosition i
 	return append([]store.PersistedEvent(nil), events...), nil
 }
 
-func (s *stubWorkerStore) GetLatestGlobalPosition(_ context.Context, _ pgx.Tx) (int64, error) {
+func (s *stubProjectorStore) GetLatestGlobalPosition(_ context.Context, _ pgx.Tx) (int64, error) {
 	if s.positionError != nil {
 		return 0, s.positionError
 	}
 	return s.latestPos, nil
 }
 
-type recordingConsumer struct {
+type recordingProjection struct {
 	handleErr error
 	name      string
 	handled   []store.PersistedEvent
 	failAt    int
 }
 
-func (c *recordingConsumer) Name() string {
+func (c *recordingProjection) Name() string {
 	return c.name
 }
 
-//nolint:gocritic // hugeParam: mirrors the production consumer contract.
-func (c *recordingConsumer) Handle(_ context.Context, _ pgx.Tx, event store.PersistedEvent) error {
+//nolint:gocritic // hugeParam: test mock
+func (c *recordingProjection) Handle(_ context.Context, _ pgx.Tx, event store.PersistedEvent) error {
 	call := len(c.handled) + 1
 	if c.failAt > 0 && call == c.failAt {
 		return c.handleErr
@@ -85,15 +84,6 @@ func (c *recordingConsumer) Handle(_ context.Context, _ pgx.Tx, event store.Pers
 
 	c.handled = append(c.handled, event)
 	return nil
-}
-
-type scopedRecordingConsumer struct {
-	recordingConsumer
-	streamTypes []string
-}
-
-func (c *scopedRecordingConsumer) StreamTypes() []string {
-	return append([]string(nil), c.streamTypes...)
 }
 
 type testDispatcher struct {
@@ -199,7 +189,7 @@ func (p *stubPgxPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, 
 		return &stubPgxRows{value: p.state.queryValues[index]}, nil
 	}
 
-	if strings.Contains(sql, "FROM consumer_checkpoints") {
+	if strings.Contains(sql, "FROM projection_checkpoints") {
 		return &stubPgxRows{value: p.state.checkpointPos}, nil
 	}
 
@@ -228,7 +218,7 @@ func (p *stubPgxPool) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row 
 		return &stubPgxRow{value: p.state.queryValues[index]}
 	}
 
-	if strings.Contains(sql, "FROM consumer_checkpoints") {
+	if strings.Contains(sql, "FROM projection_checkpoints") {
 		return &stubPgxRow{value: p.state.checkpointPos}
 	}
 
@@ -335,7 +325,7 @@ func (tx *stubPgxTx) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, e
 		return &stubPgxRows{value: tx.state.queryValues[index]}, nil
 	}
 
-	if strings.Contains(sql, "FROM consumer_checkpoints") {
+	if strings.Contains(sql, "FROM projection_checkpoints") {
 		return &stubPgxRows{value: tx.state.checkpointPos}, nil
 	}
 
@@ -364,7 +354,7 @@ func (tx *stubPgxTx) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
 		return &stubPgxRow{value: tx.state.queryValues[index]}
 	}
 
-	if strings.Contains(sql, "FROM consumer_checkpoints") {
+	if strings.Contains(sql, "FROM projection_checkpoints") {
 		return &stubPgxRow{value: tx.state.checkpointPos}
 	}
 
@@ -488,156 +478,170 @@ func openStubDB(t *testing.T, state *stubDBState) PgxPool {
 }
 
 func TestNewUsesDefaultConfig(t *testing.T) {
-	storeStub := &stubWorkerStore{}
+	storeStub := &stubProjectorStore{}
 
-	worker := New(
+	daemon := New(
 		openStubDB(t, &stubDBState{}),
 		storeStub,
-		[]consumer.Consumer{&recordingConsumer{name: "alpha"}},
+		[]Projection{&recordingProjection{name: "alpha"}},
 	)
 
 	defaults := DefaultConfig()
-	if worker.store != storeStub {
-		t.Fatal("worker store was not set")
+	if daemon.store != storeStub {
+		t.Fatal("daemon store was not set")
 	}
-	if worker.config != defaults {
-		t.Fatalf("config = %#v, want %#v", worker.config, defaults)
+	if daemon.config != defaults {
+		t.Fatalf("config = %#v, want %#v", daemon.config, defaults)
 	}
-	if worker.dispatcher == nil {
+	if daemon.dispatcher == nil {
 		t.Fatal("dispatcher was not initialized")
 	}
-	if len(worker.runningConsumers) != 0 {
-		t.Fatalf("runningConsumers length = %d, want 0", len(worker.runningConsumers))
+	if len(daemon.runningProjections) != 0 {
+		t.Fatalf("runningProjections length = %d, want 0", len(daemon.runningProjections))
 	}
 }
 
-func TestNewCopiesConsumersAndUsesConfiguredOptions(t *testing.T) {
-	storeStub := &stubWorkerStore{}
-	consumers := []consumer.Consumer{
-		&recordingConsumer{name: "alpha"},
-		&recordingConsumer{name: "beta"},
+func TestNewCopiesProjectionsAndUsesConfiguredOptions(t *testing.T) {
+	storeStub := &stubProjectorStore{}
+	projections := []Projection{
+		&recordingProjection{name: "alpha"},
+		&recordingProjection{name: "beta"},
 	}
 
-	worker := New(
+	daemon := New(
 		openStubDB(t, &stubDBState{}),
 		storeStub,
-		consumers,
+		projections,
 		WithBatchSize(7),
 		WithPollInterval(3*time.Second),
 	)
 
-	if worker.store != storeStub {
-		t.Fatal("worker store was not set")
+	if daemon.store != storeStub {
+		t.Fatal("daemon store was not set")
 	}
-	if worker.config.BatchSize != 7 {
-		t.Fatalf("BatchSize = %d, want 7", worker.config.BatchSize)
+	if daemon.config.BatchSize != 7 {
+		t.Fatalf("BatchSize = %d, want 7", daemon.config.BatchSize)
 	}
-	if worker.config.PollInterval != 3*time.Second {
-		t.Fatalf("PollInterval = %v, want %v", worker.config.PollInterval, 3*time.Second)
+	if daemon.config.PollInterval != 3*time.Second {
+		t.Fatalf("PollInterval = %v, want %v", daemon.config.PollInterval, 3*time.Second)
 	}
-	if worker.dispatcher == nil {
+	if daemon.dispatcher == nil {
 		t.Fatal("dispatcher was not initialized")
 	}
-	if len(worker.runningConsumers) != 0 {
-		t.Fatalf("runningConsumers length = %d, want 0", len(worker.runningConsumers))
+	if len(daemon.runningProjections) != 0 {
+		t.Fatalf("runningProjections length = %d, want 0", len(daemon.runningProjections))
 	}
 
-	consumers[0] = &recordingConsumer{name: "mutated"}
-	if worker.consumers[0].Name() != "alpha" {
-		t.Fatalf("worker consumer slice was not copied, got %q", worker.consumers[0].Name())
+	projections[0] = &recordingProjection{name: "mutated"}
+	if daemon.projections[0].Name() != "alpha" {
+		t.Fatalf("daemon projections slice was not copied, got %q", daemon.projections[0].Name())
 	}
 }
 
 func TestNewUsesNotifyDispatcherWhenConfigured(t *testing.T) {
-	worker := New(
+	daemon := New(
 		openStubDB(t, &stubDBState{}),
-		&stubWorkerStore{},
-		[]consumer.Consumer{&recordingConsumer{name: "alpha"}},
+		&stubProjectorStore{},
+		[]Projection{&recordingProjection{name: "alpha"}},
 		WithDispatcherStrategy(DispatcherStrategyNotify),
-		WithNotifyConnectionString("postgres://worker:test@localhost/db?sslmode=disable"),
-		WithNotifyChannel("custom_worker_events"),
+		WithNotifyConnectionString("postgres://projector:test@localhost/db?sslmode=disable"),
+		WithNotifyChannel("custom_events"),
 	)
 
-	notifyDispatcher, ok := worker.dispatcher.(*dispatcher.NotifyDispatcher)
+	notifyDispatcher, ok := daemon.dispatcher.(*dispatcher.NotifyDispatcher)
 	if !ok {
-		t.Fatalf("dispatcher type = %T, want *dispatcher.NotifyDispatcher", worker.dispatcher)
+		t.Fatalf("dispatcher type = %T, want *dispatcher.NotifyDispatcher", daemon.dispatcher)
 	}
 	if notifyDispatcher == nil {
 		t.Fatal("notify dispatcher is nil")
 	}
 }
 
-func TestWorkerValidate(t *testing.T) {
+func TestDaemonValidate(t *testing.T) {
 	validDB := openStubDB(t, &stubDBState{})
-	validStore := &stubWorkerStore{}
+	validStore := &stubProjectorStore{}
 	validDispatcher := &testDispatcher{ch: make(chan struct{})}
-	validConsumers := []consumer.Consumer{&recordingConsumer{name: "alpha"}}
+	validProjections := []Projection{&recordingProjection{name: "alpha"}}
 
 	tests := []struct {
 		name   string
-		worker *Worker
+		daemon *Daemon
 		errMsg string
 	}{
 		{
 			name:   "nil db",
-			worker: &Worker{store: validStore, dispatcher: validDispatcher, consumers: validConsumers},
+			daemon: &Daemon{store: validStore, dispatcher: validDispatcher, projections: validProjections},
 			errMsg: ErrNilDB.Error(),
 		},
 		{
 			name:   "nil store",
-			worker: &Worker{db: validDB, dispatcher: validDispatcher, consumers: validConsumers},
+			daemon: &Daemon{db: validDB, dispatcher: validDispatcher, projections: validProjections},
 			errMsg: ErrNilStore.Error(),
 		},
 		{
 			name:   "nil dispatcher",
-			worker: &Worker{db: validDB, store: validStore, consumers: validConsumers},
+			daemon: &Daemon{db: validDB, store: validStore, projections: validProjections},
 			errMsg: ErrNilDispatcher.Error(),
 		},
 		{
-			name:   "nil consumer",
-			worker: &Worker{db: validDB, store: validStore, dispatcher: validDispatcher, consumers: []consumer.Consumer{nil}},
-			errMsg: "consumer at index 0 is nil",
+			name:   "nil projection",
+			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher, projections: []Projection{nil}},
+			errMsg: "projection at index 0 is nil",
 		},
 		{
-			name:   "empty consumer name",
-			worker: &Worker{db: validDB, store: validStore, dispatcher: validDispatcher, consumers: []consumer.Consumer{&recordingConsumer{}}},
-			errMsg: "consumer at index 0 has empty name",
+			name:   "empty projection name",
+			daemon: &Daemon{db: validDB, store: validStore, dispatcher: validDispatcher, projections: []Projection{&recordingProjection{}}},
+			errMsg: "projection at index 0 has empty name",
 		},
 		{
-			name: "duplicate consumer name",
-			worker: &Worker{
-				db:         validDB,
-				store:      validStore,
-				dispatcher: validDispatcher,
-				consumers:  []consumer.Consumer{&recordingConsumer{name: "dup"}, &recordingConsumer{name: "dup"}},
+			name: "duplicate projection name",
+			daemon: &Daemon{
+				db:          validDB,
+				store:       validStore,
+				dispatcher:  validDispatcher,
+				projections: []Projection{&recordingProjection{name: "dup"}, &recordingProjection{name: "dup"}},
 			},
-			errMsg: `duplicate consumer name "dup"`,
+			errMsg: `duplicate projection name "dup"`,
 		},
 		{
 			name: "notify dispatcher requires connection string",
-			worker: &Worker{
-				db:         validDB,
-				store:      validStore,
-				dispatcher: validDispatcher,
-				consumers:  validConsumers,
-				config:     Config{DispatcherStrategy: DispatcherStrategyNotify},
+			daemon: &Daemon{
+				db:          validDB,
+				store:       validStore,
+				dispatcher:  validDispatcher,
+				projections: validProjections,
+				config:      Config{DispatcherStrategy: DispatcherStrategyNotify},
 			},
 			errMsg: ErrMissingNotifyConnectionString.Error(),
 		},
 		{
-			name: "valid worker",
-			worker: &Worker{
-				db:         validDB,
-				store:      validStore,
-				dispatcher: validDispatcher,
-				consumers:  validConsumers,
+			name: "notify dispatcher requires channel",
+			daemon: &Daemon{
+				db:          validDB,
+				store:       validStore,
+				dispatcher:  validDispatcher,
+				projections: validProjections,
+				config: Config{
+					DispatcherStrategy:     DispatcherStrategyNotify,
+					NotifyConnectionString: "postgres://localhost/db",
+				},
+			},
+			errMsg: ErrMissingNotifyChannel.Error(),
+		},
+		{
+			name: "valid daemon",
+			daemon: &Daemon{
+				db:          validDB,
+				store:       validStore,
+				dispatcher:  validDispatcher,
+				projections: validProjections,
 			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.worker.validate()
+			err := tc.daemon.validate()
 			if tc.errMsg == "" {
 				if err != nil {
 					t.Fatalf("validate() error = %v", err)
@@ -655,15 +659,15 @@ func TestWorkerValidate(t *testing.T) {
 	}
 }
 
-func TestWorkerStopInvokesCancel(t *testing.T) {
+func TestDaemonStopInvokesCancel(t *testing.T) {
 	called := 0
-	worker := &Worker{
+	daemon := &Daemon{
 		cancel: func() {
 			called++
 		},
 	}
 
-	worker.Stop()
+	daemon.Stop()
 
 	if called != 1 {
 		t.Fatalf("cancel called %d times, want 1", called)
@@ -695,8 +699,8 @@ func TestAssignmentPollInterval(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			worker := &Worker{config: tc.config}
-			if got := worker.assignmentPollInterval(); got != tc.want {
+			daemon := &Daemon{config: tc.config}
+			if got := daemon.assignmentPollInterval(); got != tc.want {
 				t.Fatalf("assignmentPollInterval() = %v, want %v", got, tc.want)
 			}
 		})
@@ -714,20 +718,20 @@ func TestProcessBatchScopedReads(t *testing.T) {
 		}
 	}
 
-	t.Run("global consumer reads the unscoped event stream", func(t *testing.T) {
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true, checkpointPos: 7}
-		storeStub := &stubWorkerStore{
+	t.Run("global projection reads the unscoped event stream", func(t *testing.T) {
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 7}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{makeEvent(1, "order")},
 		}
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := worker.processBatch(context.Background(), &recordingConsumer{name: "global"}, 0)
+		_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "global"}, 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -736,33 +740,31 @@ func TestProcessBatchScopedReads(t *testing.T) {
 		}
 	})
 
-	t.Run("scoped consumer filters matching events in memory after unscoped probe", func(t *testing.T) {
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		storeStub := &stubWorkerStore{
+	t.Run("filtered projection filters matching events in memory after unscoped probe", func(t *testing.T) {
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(1, "order"),
 				makeEvent(2, "user"),
 				makeEvent(3, "order"),
 			},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "orders"},
-			streamTypes:       []string{"order"},
-		}
-		worker := &Worker{
-			id:     workerID,
+		inner := &recordingProjection{name: "orders"}
+		registeredProjection := FilterStreamTypes(inner, "order")
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := worker.processBatch(context.Background(), registeredConsumer, 0)
+		result, err := daemon.processBatch(context.Background(), registeredProjection, 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
-		if len(registeredConsumer.handled) != 2 {
-			t.Fatalf("handled events = %d, want 2 (only order events)", len(registeredConsumer.handled))
+		if len(inner.handled) != 2 {
+			t.Fatalf("handled events = %d, want 2 (only order events)", len(inner.handled))
 		}
 		if !result.progressed {
 			t.Fatal("processBatch() progressed = false, want true")
@@ -772,23 +774,22 @@ func TestProcessBatchScopedReads(t *testing.T) {
 		}
 	})
 
-	t.Run("scoped consumer with empty types still reads the full stream", func(t *testing.T) {
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true, checkpointPos: 3}
-		storeStub := &stubWorkerStore{
+	t.Run("filtered projection with empty types still processes all events", func(t *testing.T) {
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 3}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{makeEvent(1, "order")},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "all"},
-		}
-		worker := &Worker{
-			id:     workerID,
+		inner := &recordingProjection{name: "all"}
+		registeredProjection := FilterStreamTypes(inner)
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := worker.processBatch(context.Background(), registeredConsumer, 0)
+		_, err := daemon.processBatch(context.Background(), registeredProjection, 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -797,35 +798,33 @@ func TestProcessBatchScopedReads(t *testing.T) {
 		}
 	})
 
-	t.Run("scoped consumer with no matching events does not update checkpoint", func(t *testing.T) {
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		storeStub := &stubWorkerStore{
+	t.Run("filtered projection with no matching events updates checkpoint", func(t *testing.T) {
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(1, "user"),
 				makeEvent(2, "user"),
 			},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "orders"},
-			streamTypes:       []string{"order"},
-		}
-		worker := &Worker{
-			id:     workerID,
+		inner := &recordingProjection{name: "orders"}
+		registeredProjection := FilterStreamTypes(inner, "order")
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := worker.processBatch(context.Background(), registeredConsumer, 0)
+		result, err := daemon.processBatch(context.Background(), registeredProjection, 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
 		if !result.progressed {
 			t.Fatal("processBatch() progressed = false, want true")
 		}
-		if result.handledCount != 0 {
-			t.Fatalf("handledCount = %d, want 0", result.handledCount)
+		if len(inner.handled) != 0 {
+			t.Fatalf("handledCount = %d, want 0", len(inner.handled))
 		}
 		if result.checkpoint != 2 {
 			t.Fatalf("checkpoint = %d, want 2", result.checkpoint)
@@ -900,41 +899,41 @@ func TestNextPollInterval(t *testing.T) {
 	}
 }
 
-func TestWorkerStaleGapHarborLagAllowsZero(t *testing.T) {
-	worker := &Worker{config: Config{StaleGapHarborLag: 0}}
+func TestDaemonStaleGapHarborLagAllowsZero(t *testing.T) {
+	daemon := &Daemon{config: Config{StaleGapHarborLag: 0}}
 
-	if got := worker.staleGapHarborLag(); got != 0 {
+	if got := daemon.staleGapHarborLag(); got != 0 {
 		t.Fatalf("staleGapHarborLag() = %d, want 0", got)
 	}
 }
 
-func TestWorkerStaleGapHarborLagCapsToBatchWindow(t *testing.T) {
-	worker := &Worker{
+func TestDaemonStaleGapHarborLagCapsToBatchWindow(t *testing.T) {
+	daemon := &Daemon{
 		config: Config{
 			BatchSize:         5,
 			StaleGapHarborLag: 99,
 		},
 	}
 
-	if got := worker.staleGapHarborLag(); got != 4 {
+	if got := daemon.staleGapHarborLag(); got != 4 {
 		t.Fatalf("staleGapHarborLag() = %d, want 4", got)
 	}
 }
 
-func TestInitializeCleansStaleWorkersBeforeRegistering(t *testing.T) {
-	workerID := uuid.New()
+func TestInitializeCleansStaleInstancesBeforeRegistering(t *testing.T) {
+	instanceID := uuid.New()
 	state := &stubDBState{}
-	worker := &Worker{
-		id:     workerID,
+	daemon := &Daemon{
+		id:     instanceID,
 		db:     openStubDB(t, state),
 		config: Config{HeartbeatTimeout: 5 * time.Second, Logger: store.NoOpLogger{}},
-		consumers: []consumer.Consumer{
-			&recordingConsumer{name: "alpha"},
+		projections: []Projection{
+			&recordingProjection{name: "alpha"},
 		},
 	}
 
 	registered := false
-	if err := worker.initialize(context.Background(), &registered); err != nil {
+	if err := daemon.initialize(context.Background(), &registered); err != nil {
 		t.Fatalf("initialize() error = %v", err)
 	}
 	if !registered {
@@ -946,20 +945,20 @@ func TestInitializeCleansStaleWorkersBeforeRegistering(t *testing.T) {
 	if len(state.execQueries) < 2 {
 		t.Fatalf("execQueries = %v, want cleanup and register queries", state.execQueries)
 	}
-	if !strings.Contains(state.execQueries[0], "DELETE FROM worker_nodes") {
-		t.Fatalf("first exec query = %q, want worker_nodes cleanup", state.execQueries[0])
+	if !strings.Contains(state.execQueries[0], "DELETE FROM projector_instances") {
+		t.Fatalf("first exec query = %q, want projector_instances cleanup", state.execQueries[0])
 	}
 	if !strings.Contains(state.execQueries[0], "heartbeat_at < NOW()") {
 		t.Fatalf("first exec query = %q, want stale heartbeat cutoff", state.execQueries[0])
 	}
-	if !strings.Contains(state.execQueries[1], "INSERT INTO worker_nodes") {
-		t.Fatalf("second exec query = %q, want worker registration", state.execQueries[1])
+	if !strings.Contains(state.execQueries[1], "INSERT INTO projector_instances") {
+		t.Fatalf("second exec query = %q, want instance registration", state.execQueries[1])
 	}
 }
 
 func TestRunHeartbeatLoopReportsFatalWhenRegistrationRowIsMissing(t *testing.T) {
 	state := &stubDBState{execRowsAffected: []int64{0, 0}}
-	worker := &Worker{
+	daemon := &Daemon{
 		id:         uuid.New(),
 		db:         openStubDB(t, state),
 		config:     Config{HeartbeatInterval: time.Millisecond, Logger: store.NoOpLogger{}},
@@ -971,16 +970,16 @@ func TestRunHeartbeatLoopReportsFatalWhenRegistrationRowIsMissing(t *testing.T) 
 
 	done := make(chan struct{})
 	go func() {
-		worker.runHeartbeatLoop(ctx)
+		daemon.runHeartbeatLoop(ctx)
 		close(done)
 	}()
 
 	select {
-	case err := <-worker.fatalErrCh:
-		if !errors.Is(err, workerpostgres.ErrWorkerRegistrationMissing) {
-			t.Fatalf("fatal error = %v, want ErrWorkerRegistrationMissing", err)
+	case err := <-daemon.fatalErrCh:
+		if !errors.Is(err, projectorpostgres.ErrInstanceRegistrationMissing) {
+			t.Fatalf("fatal error = %v, want ErrInstanceRegistrationMissing", err)
 		}
-		if !strings.Contains(err.Error(), "worker registration lost during heartbeat") {
+		if !strings.Contains(err.Error(), "instance registration lost during heartbeat") {
 			t.Fatalf("fatal error = %v, want wrapped heartbeat registration error", err)
 		}
 	case <-time.After(2 * time.Second):
@@ -998,48 +997,48 @@ func TestRunHeartbeatLoopReportsFatalWhenRegistrationRowIsMissing(t *testing.T) 
 	if state.execCalls < missingRegistrationRetryLimit {
 		t.Fatalf("execCalls = %d, want at least %d heartbeat attempts", state.execCalls, missingRegistrationRetryLimit)
 	}
-	if len(state.execQueries) == 0 || !strings.Contains(state.execQueries[0], "UPDATE worker_nodes") {
+	if len(state.execQueries) == 0 || !strings.Contains(state.execQueries[0], "UPDATE projector_instances") {
 		t.Fatalf("execQueries = %v, want heartbeat update query", state.execQueries)
 	}
 }
 
-func TestWaitForConsumerDelay(t *testing.T) {
+func TestWaitForProjectionDelay(t *testing.T) {
 	t.Run("returns wakeup when dispatcher signals", func(t *testing.T) {
 		ch := make(chan struct{})
 		close(ch)
 
-		worker := &Worker{dispatcher: &testDispatcher{ch: ch}}
-		woken, ok := worker.waitForConsumerDelay(context.Background(), context.Background(), time.Second)
+		daemon := &Daemon{dispatcher: &testDispatcher{ch: ch}}
+		woken, ok := daemon.waitForProjectionDelay(context.Background(), context.Background(), time.Second)
 		if !ok {
-			t.Fatal("waitForConsumerDelay() ok = false, want true")
+			t.Fatal("waitForProjectionDelay() ok = false, want true")
 		}
 		if !woken {
-			t.Fatal("waitForConsumerDelay() woken = false, want true")
+			t.Fatal("waitForProjectionDelay() woken = false, want true")
 		}
 	})
 
 	t.Run("returns when timer expires", func(t *testing.T) {
-		worker := &Worker{dispatcher: &testDispatcher{ch: make(chan struct{})}}
-		woken, ok := worker.waitForConsumerDelay(context.Background(), context.Background(), 5*time.Millisecond)
+		daemon := &Daemon{dispatcher: &testDispatcher{ch: make(chan struct{})}}
+		woken, ok := daemon.waitForProjectionDelay(context.Background(), context.Background(), 5*time.Millisecond)
 		if !ok {
-			t.Fatal("waitForConsumerDelay() ok = false, want true")
+			t.Fatal("waitForProjectionDelay() ok = false, want true")
 		}
 		if woken {
-			t.Fatal("waitForConsumerDelay() woken = true, want false")
+			t.Fatal("waitForProjectionDelay() woken = true, want false")
 		}
 	})
 
-	t.Run("stops on worker cancellation", func(t *testing.T) {
-		workerCtx, cancel := context.WithCancel(context.Background())
+	t.Run("stops on control cancellation", func(t *testing.T) {
+		controlCtx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		worker := &Worker{dispatcher: &testDispatcher{ch: make(chan struct{})}}
-		woken, ok := worker.waitForConsumerDelay(workerCtx, context.Background(), time.Second)
+		daemon := &Daemon{dispatcher: &testDispatcher{ch: make(chan struct{})}}
+		woken, ok := daemon.waitForProjectionDelay(controlCtx, context.Background(), time.Second)
 		if ok {
-			t.Fatal("waitForConsumerDelay() ok = true, want false")
+			t.Fatal("waitForProjectionDelay() ok = true, want false")
 		}
 		if woken {
-			t.Fatal("waitForConsumerDelay() woken = true, want false")
+			t.Fatal("waitForProjectionDelay() woken = true, want false")
 		}
 	})
 
@@ -1047,13 +1046,13 @@ func TestWaitForConsumerDelay(t *testing.T) {
 		assignmentCtx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		worker := &Worker{dispatcher: &testDispatcher{ch: make(chan struct{})}}
-		woken, ok := worker.waitForConsumerDelay(context.Background(), assignmentCtx, time.Second)
+		daemon := &Daemon{dispatcher: &testDispatcher{ch: make(chan struct{})}}
+		woken, ok := daemon.waitForProjectionDelay(context.Background(), assignmentCtx, time.Second)
 		if ok {
-			t.Fatal("waitForConsumerDelay() ok = true, want false")
+			t.Fatal("waitForProjectionDelay() ok = true, want false")
 		}
 		if woken {
-			t.Fatal("waitForConsumerDelay() woken = true, want false")
+			t.Fatal("waitForProjectionDelay() woken = true, want false")
 		}
 	})
 }
@@ -1070,24 +1069,24 @@ func TestProcessBatch(t *testing.T) {
 	}
 
 	t.Run("commits processed batch and saves checkpoint", func(t *testing.T) {
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true, checkpointPos: 3}
-		storeStub := &stubWorkerStore{
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 3}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(4, "order"),
 				makeEvent(5, "order"),
 			},
 		}
-		registeredConsumer := &recordingConsumer{name: "orders"}
+		registeredProjection := &recordingProjection{name: "orders"}
 
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: Config{BatchSize: 2, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := worker.processBatch(context.Background(), registeredConsumer, 3)
+		result, err := daemon.processBatch(context.Background(), registeredProjection, 3)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1109,8 +1108,8 @@ func TestProcessBatch(t *testing.T) {
 		if storeStub.lastLimit != 2 {
 			t.Fatalf("ReadEvents limit = %d, want 2", storeStub.lastLimit)
 		}
-		if len(registeredConsumer.handled) != 2 {
-			t.Fatalf("handled events = %d, want 2", len(registeredConsumer.handled))
+		if len(registeredProjection.handled) != 2 {
+			t.Fatalf("handled events = %d, want 2", len(registeredProjection.handled))
 		}
 
 		state.mu.Lock()
@@ -1128,17 +1127,17 @@ func TestProcessBatch(t *testing.T) {
 		if state.rollbackCalls != 1 {
 			t.Fatalf("rollbackCalls = %d, want 1 (probe rollback)", state.rollbackCalls)
 		}
-		if len(state.execQueries) != 1 || !strings.Contains(state.execQueries[0], "consumer_checkpoints") {
+		if len(state.execQueries) != 1 || !strings.Contains(state.execQueries[0], "projection_checkpoints") {
 			t.Fatalf("execQueries = %v, want checkpoint update", state.execQueries)
 		}
 		if len(state.ops) < 3 || state.ops[0] != "begin" || state.ops[1] != "rollback" || state.ops[2] != "begin" {
 			t.Fatalf("ops = %v, want probe tx before batch tx", state.ops)
 		}
 		if len(state.execArgs) != 1 || len(state.execArgs[0]) != 2 {
-			t.Fatalf("execArgs = %#v, want consumer name and checkpoint", state.execArgs)
+			t.Fatalf("execArgs = %#v, want projection name and checkpoint", state.execArgs)
 		}
 		if got := state.execArgs[0][0]; got != "orders" {
-			t.Fatalf("checkpoint consumer arg = %v, want orders", got)
+			t.Fatalf("checkpoint projection arg = %v, want orders", got)
 		}
 		if got := state.execArgs[0][1]; got != int64(5) {
 			t.Fatalf("checkpoint position arg = %v, want 5", got)
@@ -1146,16 +1145,16 @@ func TestProcessBatch(t *testing.T) {
 	})
 
 	t.Run("returns no batch when store has no events", func(t *testing.T) {
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true, checkpointPos: 7}
-		worker := &Worker{
-			id:     workerID,
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 7}
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
-			store:  &stubWorkerStore{},
+			store:  &stubProjectorStore{},
 			config: Config{BatchSize: 3, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := worker.processBatch(context.Background(), &recordingConsumer{name: "empty"}, 0)
+		result, err := daemon.processBatch(context.Background(), &recordingProjection{name: "empty"}, 0)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1177,25 +1176,25 @@ func TestProcessBatch(t *testing.T) {
 	})
 
 	t.Run("checkpoint drift between probe and batch causes a quick re-probe", func(t *testing.T) {
-		workerID := uuid.New()
+		instanceID := uuid.New()
 		state := &stubDBState{
 			queryValues: []any{
-				workerID.String(),
+				instanceID.String(),
 				int64(5),
 			},
 		}
-		registeredConsumer := &recordingConsumer{name: "orders"}
-		worker := &Worker{
-			id:    workerID,
+		registeredProjection := &recordingProjection{name: "orders"}
+		daemon := &Daemon{
+			id:    instanceID,
 			db:    openStubDB(t, state),
-			store: &stubWorkerStore{events: []store.PersistedEvent{makeEvent(4, "order"), makeEvent(5, "order")}},
+			store: &stubProjectorStore{events: []store.PersistedEvent{makeEvent(4, "order"), makeEvent(5, "order")}},
 			config: Config{
 				BatchSize: 2,
 				Logger:    store.NoOpLogger{},
 			},
 		}
 
-		result, err := worker.processBatch(context.Background(), registeredConsumer, 3)
+		result, err := daemon.processBatch(context.Background(), registeredProjection, 3)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1208,8 +1207,8 @@ func TestProcessBatch(t *testing.T) {
 		if result.checkpoint != 5 {
 			t.Fatalf("processBatch() checkpoint = %d, want 5", result.checkpoint)
 		}
-		if len(registeredConsumer.handled) != 0 {
-			t.Fatalf("handled events = %d, want 0", len(registeredConsumer.handled))
+		if len(registeredProjection.handled) != 0 {
+			t.Fatalf("handled events = %d, want 0", len(registeredProjection.handled))
 		}
 
 		state.mu.Lock()
@@ -1222,28 +1221,26 @@ func TestProcessBatch(t *testing.T) {
 		}
 	})
 
-	t.Run("scoped consumer only receives matching events via in-memory filter", func(t *testing.T) {
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true, checkpointPos: 7}
-		storeStub := &stubWorkerStore{
+	t.Run("filtered projection only receives matching events via in-memory filter", func(t *testing.T) {
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 7}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(8, "order"),
 				makeEvent(9, "user"),
 			},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "orders"},
-			streamTypes:       []string{"order"},
-		}
+		inner := &recordingProjection{name: "orders"}
+		registeredProjection := FilterStreamTypes(inner, "order")
 
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: Config{BatchSize: 10, Logger: store.NoOpLogger{}},
 		}
 
-		result, err := worker.processBatch(context.Background(), registeredConsumer, 7)
+		result, err := daemon.processBatch(context.Background(), registeredProjection, 7)
 		if err != nil {
 			t.Fatalf("processBatch() error = %v", err)
 		}
@@ -1253,27 +1250,27 @@ func TestProcessBatch(t *testing.T) {
 		if result.checkpoint != 9 {
 			t.Fatalf("checkpoint = %d, want 9 (safe frontier)", result.checkpoint)
 		}
-		if len(registeredConsumer.handled) != 1 {
-			t.Fatalf("handled events = %d, want 1", len(registeredConsumer.handled))
+		if len(inner.handled) != 1 {
+			t.Fatalf("handled events = %d, want 1", len(inner.handled))
 		}
-		if registeredConsumer.handled[0].StreamType != "order" {
-			t.Fatalf("handled stream type = %q, want order", registeredConsumer.handled[0].StreamType)
+		if inner.handled[0].StreamType != "order" {
+			t.Fatalf("handled stream type = %q, want order", inner.handled[0].StreamType)
 		}
 	})
 
 	t.Run("returns read error and rolls back", func(t *testing.T) {
 		readErr := errors.New("read failed")
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		worker := &Worker{
-			id:     workerID,
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
-			store:  &stubWorkerStore{readErr: readErr},
+			store:  &stubProjectorStore{readErr: readErr},
 			config: Config{BatchSize: 3, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := worker.processBatch(context.Background(), &recordingConsumer{name: "reader"}, 0)
-		if err == nil || !strings.Contains(err.Error(), "probe frontier for consumer reader: read failed") {
+		_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "reader"}, 0)
+		if err == nil || !strings.Contains(err.Error(), "probe frontier for projection reader: read failed") {
 			t.Fatalf("processBatch() error = %v, want wrapped read error", err)
 		}
 
@@ -1289,25 +1286,25 @@ func TestProcessBatch(t *testing.T) {
 
 	t.Run("returns handler error and rolls back", func(t *testing.T) {
 		handleErr := errors.New("boom")
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		registeredConsumer := &recordingConsumer{name: "handler", failAt: 1, handleErr: handleErr}
-		worker := &Worker{
-			id:    workerID,
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		registeredProjection := &recordingProjection{name: "handler", failAt: 1, handleErr: handleErr}
+		daemon := &Daemon{
+			id:    instanceID,
 			db:    openStubDB(t, state),
-			store: &stubWorkerStore{events: []store.PersistedEvent{makeEvent(1, "order")}},
+			store: &stubProjectorStore{events: []store.PersistedEvent{makeEvent(1, "order")}},
 			config: Config{
 				BatchSize: 1,
 				Logger:    store.NoOpLogger{},
 			},
 		}
 
-		_, err := worker.processBatch(context.Background(), registeredConsumer, 0)
-		if err == nil || !strings.Contains(err.Error(), "handle event") || !strings.Contains(err.Error(), "for consumer handler: boom") {
+		_, err := daemon.processBatch(context.Background(), registeredProjection, 0)
+		if err == nil || !strings.Contains(err.Error(), "handle event") || !strings.Contains(err.Error(), "for projection handler: boom") {
 			t.Fatalf("processBatch() error = %v, want wrapped handler error", err)
 		}
-		if len(registeredConsumer.handled) != 0 {
-			t.Fatalf("handled events = %d, want 0", len(registeredConsumer.handled))
+		if len(registeredProjection.handled) != 0 {
+			t.Fatalf("handled events = %d, want 0", len(registeredProjection.handled))
 		}
 
 		state.mu.Lock()
@@ -1321,21 +1318,21 @@ func TestProcessBatch(t *testing.T) {
 	})
 
 	t.Run("returns checkpoint save error and rolls back", func(t *testing.T) {
-		workerID := uuid.New()
+		instanceID := uuid.New()
 		state := &stubDBState{
 			execErr:    errors.New("checkpoint failed"),
-			ownerID:    workerID.String(),
+			ownerID:    instanceID.String(),
 			ownerValid: true,
 		}
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
-			store:  &stubWorkerStore{events: []store.PersistedEvent{makeEvent(1, "order")}},
+			store:  &stubProjectorStore{events: []store.PersistedEvent{makeEvent(1, "order")}},
 			config: Config{BatchSize: 1, Logger: store.NoOpLogger{}},
 		}
 
-		_, err := worker.processBatch(context.Background(), &recordingConsumer{name: "checkpoint"}, 0)
-		if err == nil || !strings.Contains(err.Error(), "save checkpoint for consumer checkpoint: save checkpoint for consumer checkpoint: checkpoint failed") {
+		_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "checkpoint"}, 0)
+		if err == nil || !strings.Contains(err.Error(), "save checkpoint for projection checkpoint: save checkpoint for projection checkpoint: checkpoint failed") {
 			t.Fatalf("processBatch() error = %v, want wrapped checkpoint error", err)
 		}
 
@@ -1357,9 +1354,9 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		storeStub := &stubWorkerStore{
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(2, "order"),
 				makeEvent(3, "order"),
@@ -1370,8 +1367,8 @@ func TestProcessBatch(t *testing.T) {
 		config.BatchPause = time.Millisecond
 		config.StaleGapThreshold = 10 * time.Second
 		config.Logger = store.NoOpLogger{}
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: config,
@@ -1379,7 +1376,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), &recordingConsumer{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1392,8 +1389,8 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		secondConsumer := &recordingConsumer{name: "orders"}
-		second, err := worker.processBatchWithGapState(context.Background(), secondConsumer, gap, 0)
+		secondProjection := &recordingProjection{name: "orders"}
+		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1406,11 +1403,11 @@ func TestProcessBatch(t *testing.T) {
 		if second.checkpoint != 2 {
 			t.Fatalf("checkpoint = %d, want 2", second.checkpoint)
 		}
-		if len(secondConsumer.handled) != 1 {
-			t.Fatalf("handled events = %d, want 1", len(secondConsumer.handled))
+		if len(secondProjection.handled) != 1 {
+			t.Fatalf("handled events = %d, want 1", len(secondProjection.handled))
 		}
-		if secondConsumer.handled[0].GlobalPosition != 2 {
-			t.Fatalf("handled position = %d, want 2", secondConsumer.handled[0].GlobalPosition)
+		if secondProjection.handled[0].GlobalPosition != 2 {
+			t.Fatalf("handled position = %d, want 2", secondProjection.handled[0].GlobalPosition)
 		}
 
 		state.mu.Lock()
@@ -1418,7 +1415,7 @@ func TestProcessBatch(t *testing.T) {
 		if state.execCalls != 2 {
 			t.Fatalf("execCalls = %d, want 2 (gap skip + checkpoint)", state.execCalls)
 		}
-		if len(state.execQueries) < 2 || !strings.Contains(state.execQueries[0], "consumer_gap_skips") {
+		if len(state.execQueries) < 2 || !strings.Contains(state.execQueries[0], "projection_gap_skips") {
 			t.Fatalf("execQueries = %v, want gap skip insert in second batch", state.execQueries)
 		}
 	})
@@ -1431,9 +1428,9 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		storeStub := &stubWorkerStore{
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		storeStub := &stubProjectorStore{
 			readBatches: [][]store.PersistedEvent{
 				{
 					makeEvent(2, "order"),
@@ -1454,8 +1451,8 @@ func TestProcessBatch(t *testing.T) {
 		config.BatchPause = time.Millisecond
 		config.StaleGapThreshold = 10 * time.Second
 		config.Logger = store.NoOpLogger{}
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: config,
@@ -1463,7 +1460,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), &recordingConsumer{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1473,8 +1470,8 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		secondConsumer := &recordingConsumer{name: "orders"}
-		second, err := worker.processBatchWithGapState(context.Background(), secondConsumer, gap, 0)
+		secondProjection := &recordingProjection{name: "orders"}
+		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1487,11 +1484,11 @@ func TestProcessBatch(t *testing.T) {
 		if second.checkpoint != 2 {
 			t.Fatalf("checkpoint = %d, want 2", second.checkpoint)
 		}
-		if len(secondConsumer.handled) != 1 {
-			t.Fatalf("handled events = %d, want 1", len(secondConsumer.handled))
+		if len(secondProjection.handled) != 1 {
+			t.Fatalf("handled events = %d, want 1", len(secondProjection.handled))
 		}
-		if secondConsumer.handled[0].GlobalPosition != 2 {
-			t.Fatalf("handled position = %d, want 2", secondConsumer.handled[0].GlobalPosition)
+		if secondProjection.handled[0].GlobalPosition != 2 {
+			t.Fatalf("handled position = %d, want 2", secondProjection.handled[0].GlobalPosition)
 		}
 		if storeStub.readCalls != 3 {
 			t.Fatalf("ReadEvents calls = %d, want 3 (initial probe + stale probe + revalidation)", storeStub.readCalls)
@@ -1502,7 +1499,7 @@ func TestProcessBatch(t *testing.T) {
 		if state.execCalls != 2 {
 			t.Fatalf("execCalls = %d, want 2 (gap skip + checkpoint)", state.execCalls)
 		}
-		if len(state.execQueries) < 2 || !strings.Contains(state.execQueries[0], "consumer_gap_skips") {
+		if len(state.execQueries) < 2 || !strings.Contains(state.execQueries[0], "projection_gap_skips") {
 			t.Fatalf("execQueries = %v, want gap skip insert in second batch", state.execQueries)
 		}
 	})
@@ -1515,13 +1512,13 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
+		instanceID := uuid.New()
 		state := &stubDBState{
 			execErr:    errors.New("gap skip failed"),
-			ownerID:    workerID.String(),
+			ownerID:    instanceID.String(),
 			ownerValid: true,
 		}
-		storeStub := &stubWorkerStore{
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(2, "order"),
 				makeEvent(3, "order"),
@@ -1532,8 +1529,8 @@ func TestProcessBatch(t *testing.T) {
 		config.BatchPause = time.Millisecond
 		config.StaleGapThreshold = 10 * time.Second
 		config.Logger = store.NoOpLogger{}
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: config,
@@ -1541,7 +1538,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), &recordingConsumer{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1551,8 +1548,8 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		_, err = worker.processBatchWithGapState(context.Background(), &recordingConsumer{name: "orders"}, gap, 0)
-		if err == nil || !strings.Contains(err.Error(), "record gap skip for consumer orders: gap skip failed") {
+		_, err = daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+		if err == nil || !strings.Contains(err.Error(), "record gap skip for projection orders: gap skip failed") {
 			t.Fatalf("processBatchWithGapState() error = %v, want wrapped gap skip error", err)
 		}
 
@@ -1561,7 +1558,7 @@ func TestProcessBatch(t *testing.T) {
 		if state.execCalls != 1 {
 			t.Fatalf("execCalls = %d, want 1 (gap skip insert only)", state.execCalls)
 		}
-		if len(state.execQueries) != 1 || !strings.Contains(state.execQueries[0], "consumer_gap_skips") {
+		if len(state.execQueries) != 1 || !strings.Contains(state.execQueries[0], "projection_gap_skips") {
 			t.Fatalf("execQueries = %v, want only gap skip insert", state.execQueries)
 		}
 		if state.commitCalls != 0 {
@@ -1572,7 +1569,7 @@ func TestProcessBatch(t *testing.T) {
 		}
 	})
 
-	t.Run("scoped stale gap with zero handled events still advances under the default lag", func(t *testing.T) {
+	t.Run("filtered stale gap with zero handled events still advances under the default lag", func(t *testing.T) {
 		originalNow := timeNow
 		defer func() { timeNow = originalNow }()
 
@@ -1580,25 +1577,23 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		storeStub := &stubWorkerStore{
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(2, "order"),
 				makeEvent(3, "order"),
 			},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "users"},
-			streamTypes:       []string{"user"},
-		}
+		inner := &recordingProjection{name: "users"}
+		registeredProjection := FilterStreamTypes(inner, "user")
 		config := DefaultConfig()
 		config.BatchSize = 10
 		config.BatchPause = time.Millisecond
 		config.StaleGapThreshold = 10 * time.Second
 		config.Logger = store.NoOpLogger{}
-		worker := &Worker{
-			id:     workerID,
+		daemon := &Daemon{
+			id:     instanceID,
 			db:     openStubDB(t, state),
 			store:  storeStub,
 			config: config,
@@ -1606,7 +1601,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1616,7 +1611,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1629,8 +1624,8 @@ func TestProcessBatch(t *testing.T) {
 		if second.checkpoint != 2 {
 			t.Fatalf("checkpoint = %d, want 2", second.checkpoint)
 		}
-		if len(registeredConsumer.handled) != 0 {
-			t.Fatalf("handled events = %d, want 0", len(registeredConsumer.handled))
+		if len(inner.handled) != 0 {
+			t.Fatalf("handled events = %d, want 0", len(inner.handled))
 		}
 
 		state.mu.Lock()
@@ -1648,17 +1643,17 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		storeStub := &stubWorkerStore{
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(2, "order"),
 				makeEvent(3, "order"),
 				makeEvent(4, "order"),
 			},
 		}
-		worker := &Worker{
-			id:    workerID,
+		daemon := &Daemon{
+			id:    instanceID,
 			db:    openStubDB(t, state),
 			store: storeStub,
 			config: Config{
@@ -1672,7 +1667,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), &recordingConsumer{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1685,8 +1680,8 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		secondConsumer := &recordingConsumer{name: "orders"}
-		second, err := worker.processBatchWithGapState(context.Background(), secondConsumer, gap, 0)
+		secondProjection := &recordingProjection{name: "orders"}
+		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1699,8 +1694,8 @@ func TestProcessBatch(t *testing.T) {
 		if second.checkpoint != 3 {
 			t.Fatalf("checkpoint = %d, want 3", second.checkpoint)
 		}
-		if len(secondConsumer.handled) != 2 {
-			t.Fatalf("handled events = %d, want 2", len(secondConsumer.handled))
+		if len(secondProjection.handled) != 2 {
+			t.Fatalf("handled events = %d, want 2", len(secondProjection.handled))
 		}
 
 		state.mu.Lock()
@@ -1708,7 +1703,7 @@ func TestProcessBatch(t *testing.T) {
 		if state.execCalls != 2 {
 			t.Fatalf("execCalls = %d, want 2 (gap skip + checkpoint)", state.execCalls)
 		}
-		if len(state.execQueries) < 2 || !strings.Contains(state.execQueries[0], "consumer_gap_skips") {
+		if len(state.execQueries) < 2 || !strings.Contains(state.execQueries[0], "projection_gap_skips") {
 			t.Fatalf("execQueries = %v, want gap skip insert in second batch", state.execQueries)
 		}
 	})
@@ -1721,9 +1716,9 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
-		state := &stubDBState{ownerID: workerID.String(), ownerValid: true}
-		storeStub := &stubWorkerStore{
+		instanceID := uuid.New()
+		state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+		storeStub := &stubProjectorStore{
 			readBatches: [][]store.PersistedEvent{
 				{
 					makeEvent(2, "order"),
@@ -1742,8 +1737,8 @@ func TestProcessBatch(t *testing.T) {
 				},
 			},
 		}
-		worker := &Worker{
-			id:    workerID,
+		daemon := &Daemon{
+			id:    instanceID,
 			db:    openStubDB(t, state),
 			store: storeStub,
 			config: Config{
@@ -1757,7 +1752,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), &recordingConsumer{name: "orders"}, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1767,8 +1762,8 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		secondConsumer := &recordingConsumer{name: "orders"}
-		second, err := worker.processBatchWithGapState(context.Background(), secondConsumer, gap, 0)
+		secondProjection := &recordingProjection{name: "orders"}
+		second, err := daemon.processBatchWithGapState(context.Background(), secondProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1781,8 +1776,8 @@ func TestProcessBatch(t *testing.T) {
 		if second.checkpoint != 3 {
 			t.Fatalf("checkpoint = %d, want 3", second.checkpoint)
 		}
-		if len(secondConsumer.handled) != 3 {
-			t.Fatalf("handled events = %d, want 3", len(secondConsumer.handled))
+		if len(secondProjection.handled) != 3 {
+			t.Fatalf("handled events = %d, want 3", len(secondProjection.handled))
 		}
 
 		state.mu.Lock()
@@ -1790,7 +1785,7 @@ func TestProcessBatch(t *testing.T) {
 		if state.execCalls != 1 {
 			t.Fatalf("execCalls = %d, want 1 (checkpoint update only)", state.execCalls)
 		}
-		if len(state.execQueries) != 1 || strings.Contains(state.execQueries[0], "consumer_gap_skips") {
+		if len(state.execQueries) != 1 || strings.Contains(state.execQueries[0], "projection_gap_skips") {
 			t.Fatalf("execQueries = %v, want checkpoint update only", state.execQueries)
 		}
 	})
@@ -1803,25 +1798,23 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
+		instanceID := uuid.New()
 		state := &stubDBState{
-			ownerID:      workerID.String(),
+			ownerID:      instanceID.String(),
 			ownerValid:   true,
 			commitErrors: []error{&pgconn.PgError{Code: "40001"}, nil},
 		}
-		storeStub := &stubWorkerStore{
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(2, "order"),
 				makeEvent(3, "order"),
 				makeEvent(4, "order"),
 			},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "users"},
-			streamTypes:       []string{"user"},
-		}
-		worker := &Worker{
-			id:    workerID,
+		inner := &recordingProjection{name: "users"}
+		registeredProjection := FilterStreamTypes(inner, "user")
+		daemon := &Daemon{
+			id:    instanceID,
 			db:    openStubDB(t, state),
 			store: storeStub,
 			config: Config{
@@ -1835,7 +1828,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1845,7 +1838,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -1858,8 +1851,8 @@ func TestProcessBatch(t *testing.T) {
 		if second.checkpoint != 3 {
 			t.Fatalf("checkpoint = %d, want 3", second.checkpoint)
 		}
-		if len(registeredConsumer.handled) != 0 {
-			t.Fatalf("handled events = %d, want 0", len(registeredConsumer.handled))
+		if len(inner.handled) != 0 {
+			t.Fatalf("handled events = %d, want 0", len(inner.handled))
 		}
 
 		state.mu.Lock()
@@ -1877,9 +1870,9 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
+		instanceID := uuid.New()
 		state := &stubDBState{
-			ownerID:    workerID.String(),
+			ownerID:    instanceID.String(),
 			ownerValid: true,
 			commitErrors: []error{
 				&pgconn.PgError{Code: "40001"},
@@ -1887,19 +1880,17 @@ func TestProcessBatch(t *testing.T) {
 				&pgconn.PgError{Code: "40001"},
 			},
 		}
-		storeStub := &stubWorkerStore{
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(2, "order"),
 				makeEvent(3, "order"),
 				makeEvent(4, "order"),
 			},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "users"},
-			streamTypes:       []string{"user"},
-		}
-		worker := &Worker{
-			id:    workerID,
+		inner := &recordingProjection{name: "users"}
+		registeredProjection := FilterStreamTypes(inner, "user")
+		daemon := &Daemon{
+			id:    instanceID,
 			db:    openStubDB(t, state),
 			store: storeStub,
 			config: Config{
@@ -1913,7 +1904,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1923,7 +1914,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v, want nil", err)
 		}
@@ -1952,25 +1943,23 @@ func TestProcessBatch(t *testing.T) {
 		now := base
 		timeNow = func() time.Time { return now }
 
-		workerID := uuid.New()
+		instanceID := uuid.New()
 		state := &stubDBState{
-			ownerID:      workerID.String(),
+			ownerID:      instanceID.String(),
 			ownerValid:   true,
 			commitErrors: []error{&stubSQLStateError{code: "40001"}, nil},
 		}
-		storeStub := &stubWorkerStore{
+		storeStub := &stubProjectorStore{
 			events: []store.PersistedEvent{
 				makeEvent(2, "order"),
 				makeEvent(3, "order"),
 				makeEvent(4, "order"),
 			},
 		}
-		registeredConsumer := &scopedRecordingConsumer{
-			recordingConsumer: recordingConsumer{name: "users"},
-			streamTypes:       []string{"user"},
-		}
-		worker := &Worker{
-			id:    workerID,
+		inner := &recordingProjection{name: "users"}
+		registeredProjection := FilterStreamTypes(inner, "user")
+		daemon := &Daemon{
+			id:    instanceID,
 			db:    openStubDB(t, state),
 			store: storeStub,
 			config: Config{
@@ -1984,7 +1973,7 @@ func TestProcessBatch(t *testing.T) {
 
 		gap := &gapState{}
 
-		first, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		first, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("first processBatchWithGapState() error = %v", err)
 		}
@@ -1994,7 +1983,7 @@ func TestProcessBatch(t *testing.T) {
 
 		now = base.Add(11 * time.Second)
 
-		second, err := worker.processBatchWithGapState(context.Background(), registeredConsumer, gap, 0)
+		second, err := daemon.processBatchWithGapState(context.Background(), registeredProjection, gap, 0)
 		if err != nil {
 			t.Fatalf("second processBatchWithGapState() error = %v", err)
 		}
@@ -2007,8 +1996,8 @@ func TestProcessBatch(t *testing.T) {
 		if second.checkpoint != 3 {
 			t.Fatalf("checkpoint = %d, want 3", second.checkpoint)
 		}
-		if len(registeredConsumer.handled) != 0 {
-			t.Fatalf("handled events = %d, want 0", len(registeredConsumer.handled))
+		if len(inner.handled) != 0 {
+			t.Fatalf("handled events = %d, want 0", len(inner.handled))
 		}
 
 		state.mu.Lock()

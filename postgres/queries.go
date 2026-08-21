@@ -15,13 +15,13 @@ type DB interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// Default table names for worker infrastructure metadata.
+// Default table names for projector infrastructure metadata.
 const (
-	DefaultWorkerNodesTable         = "worker_nodes"
-	DefaultConsumerAssignmentsTable = "consumer_assignments"
-	DefaultConsumerCheckpointsTable = "consumer_checkpoints"
-	DefaultConsumerGapSkipsTable    = "consumer_gap_skips"
-	DefaultLeaderElectionTable      = "worker_leader_election"
+	DefaultProjectorInstancesTable    = "projector_instances"
+	DefaultProjectionAssignmentsTable = "projection_assignments"
+	DefaultProjectionCheckpointsTable = "projection_checkpoints"
+	DefaultProjectionGapSkipsTable    = "projection_gap_skips"
+	DefaultProjectorLeaderLeasesTable = "projector_leader_leases"
 )
 
 func resolveTableName(tableName, defaultTableName string) string {

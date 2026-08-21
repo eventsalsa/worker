@@ -15,16 +15,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/eventsalsa/store"
-	"github.com/eventsalsa/store/consumer"
-	storemigrations "github.com/eventsalsa/store/migrations"
-	storepostgres "github.com/eventsalsa/store/postgres"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	workerpkg "github.com/eventsalsa/worker"
-	workermigrations "github.com/eventsalsa/worker/migrations"
-	workerpostgres "github.com/eventsalsa/worker/postgres"
+	"github.com/eventsalsa/store"
+	storemigrations "github.com/eventsalsa/store/migrations"
+	storepostgres "github.com/eventsalsa/store/postgres"
+
+	projectorpkg "github.com/eventsalsa/projector"
+	projectormigrations "github.com/eventsalsa/projector/migrations"
+	projectorpostgres "github.com/eventsalsa/projector/postgres"
 )
 
 func TestMain(m *testing.M) {
@@ -36,7 +35,7 @@ func TestMain(m *testing.M) {
 
 	pgContainer, err := postgres.Run(ctx,
 		"postgres:16-alpine",
-		postgres.WithDatabase("eventsalsa_worker_test"),
+		postgres.WithDatabase("eventsalsa_projector_test"),
 		postgres.WithUsername("postgres"),
 		postgres.WithPassword("postgres"),
 		postgres.BasicWaitStrategies(),
@@ -64,7 +63,7 @@ func TestMain(m *testing.M) {
 	_ = os.Setenv("POSTGRES_PORT", port.Port())
 	_ = os.Setenv("POSTGRES_USER", "postgres")
 	_ = os.Setenv("POSTGRES_PASSWORD", "postgres")
-	_ = os.Setenv("POSTGRES_DB", "eventsalsa_worker_test")
+	_ = os.Setenv("POSTGRES_DB", "eventsalsa_projector_test")
 
 	code := m.Run()
 
@@ -76,9 +75,9 @@ func TestMain(m *testing.M) {
 }
 
 const (
-	testWaitInterval      = 50 * time.Millisecond
-	defaultWaitTimeout    = 12 * time.Second
-	workerShutdownTimeout = 10 * time.Second
+	testWaitInterval         = 50 * time.Millisecond
+	defaultWaitTimeout       = 12 * time.Second
+	projectorShutdownTimeout = 10 * time.Second
 )
 
 type testEventBatch struct {
@@ -97,7 +96,7 @@ type failurePlan struct {
 	remaining int
 }
 
-type testConsumer struct {
+type testProjection struct {
 	name          string
 	instanceLabel string
 	streamTypes   []string
@@ -109,8 +108,8 @@ type testConsumer struct {
 	failures        map[int64]failurePlan
 }
 
-type testConsumerEventRow struct {
-	ConsumerName   string
+type testProjectionEventRow struct {
+	ProjectionName string
 	GlobalPosition int64
 	StreamType     string
 	StreamID       string
@@ -120,16 +119,16 @@ type testConsumerEventRow struct {
 }
 
 type gapSkipRow struct {
-	ConsumerName           string
+	ProjectionName         string
 	GapPosition            int64
 	SkipToPosition         int64
 	HighestVisiblePosition int64
 }
 
-type testWorkerHarness struct {
+type testProjectorHarness struct {
 	label    string
 	db       *pgxpool.Pool
-	worker   *workerpkg.Worker
+	daemon   *projectorpkg.Daemon
 	cancel   context.CancelFunc
 	errCh    chan error
 	stopOnce sync.Once
@@ -160,7 +159,7 @@ func openTestDB(t testing.TB) *pgxpool.Pool {
 
 	dbName := os.Getenv("POSTGRES_DB")
 	if dbName == "" {
-		dbName = "eventsalsa_worker_test"
+		dbName = "eventsalsa_projector_test"
 	}
 
 	connStr := fmt.Sprintf(
@@ -219,12 +218,12 @@ func setupSchema(t testing.TB, db *pgxpool.Pool) {
 	defer cancel()
 
 	_, err := db.Exec(ctx, `
-DROP TABLE IF EXISTS test_consumer_events CASCADE;
-DROP TABLE IF EXISTS worker_leader_election CASCADE;
-DROP TABLE IF EXISTS consumer_gap_skips CASCADE;
-DROP TABLE IF EXISTS consumer_checkpoints CASCADE;
-DROP TABLE IF EXISTS consumer_assignments CASCADE;
-DROP TABLE IF EXISTS worker_nodes CASCADE;
+DROP TABLE IF EXISTS test_projection_events CASCADE;
+DROP TABLE IF EXISTS projector_leader_leases CASCADE;
+DROP TABLE IF EXISTS projection_gap_skips CASCADE;
+DROP TABLE IF EXISTS projection_checkpoints CASCADE;
+DROP TABLE IF EXISTS projection_assignments CASCADE;
+DROP TABLE IF EXISTS projector_instances CASCADE;
 DROP TABLE IF EXISTS stream_heads CASCADE;
 DROP TABLE IF EXISTS events CASCADE;
 `)
@@ -239,15 +238,15 @@ DROP TABLE IF EXISTS events CASCADE;
 		t.Fatalf("execute store migration: %v", err)
 	}
 
-	workerSQL := generateWorkerSQL(t, tmpDir)
+	projectorSQL := generateProjectorSQL(t, tmpDir)
 
-	if _, err := db.Exec(ctx, string(workerSQL)); err != nil {
-		t.Fatalf("execute worker migration: %v", err)
+	if _, err := db.Exec(ctx, string(projectorSQL)); err != nil {
+		t.Fatalf("execute projector migration: %v", err)
 	}
 
 	_, err = db.Exec(ctx, `
-CREATE TABLE test_consumer_events (
-consumer_name TEXT NOT NULL,
+CREATE TABLE test_projection_events (
+projection_name TEXT NOT NULL,
 global_position BIGINT NOT NULL,
 stream_type TEXT NOT NULL,
 stream_id TEXT NOT NULL,
@@ -255,7 +254,7 @@ event_type TEXT NOT NULL,
 handled_by TEXT NOT NULL,
 attempt_no INT NOT NULL,
 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-PRIMARY KEY (consumer_name, global_position)
+PRIMARY KEY (projection_name, global_position)
 )
 `)
 	if err != nil {
@@ -271,12 +270,12 @@ func cleanupTables(t testing.TB, db *pgxpool.Pool) {
 
 	if _, err := db.Exec(ctx, `
 TRUNCATE TABLE
-test_consumer_events,
-worker_leader_election,
-consumer_gap_skips,
-consumer_checkpoints,
-consumer_assignments,
-worker_nodes,
+test_projection_events,
+projector_leader_leases,
+projection_gap_skips,
+projection_checkpoints,
+projection_assignments,
+projector_instances,
 stream_heads,
 events
 RESTART IDENTITY CASCADE
@@ -437,8 +436,8 @@ func waitForErr(t testing.TB, timeout time.Duration, fn func() error) {
 	}
 }
 
-func newTestConsumer(name, instanceLabel string, streamTypes []string) *testConsumer {
-	return &testConsumer{
+func newTestProjection(name, instanceLabel string, streamTypes []string) *testProjection {
+	return &testProjection{
 		name:          name,
 		instanceLabel: instanceLabel,
 		streamTypes:   append([]string(nil), streamTypes...),
@@ -447,15 +446,11 @@ func newTestConsumer(name, instanceLabel string, streamTypes []string) *testCons
 	}
 }
 
-func (c *testConsumer) Name() string {
+func (c *testProjection) Name() string {
 	return c.name
 }
 
-func (c *testConsumer) StreamTypes() []string {
-	return append([]string(nil), c.streamTypes...)
-}
-
-func (c *testConsumer) Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error {
+func (c *testProjection) Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error {
 	c.mu.Lock()
 	c.attempts[event.GlobalPosition]++
 	attemptNo := c.attempts[event.GlobalPosition]
@@ -482,8 +477,8 @@ func (c *testConsumer) Handle(ctx context.Context, tx pgx.Tx, event store.Persis
 	}
 
 	_, err := tx.Exec(ctx, `
-INSERT INTO test_consumer_events (
-consumer_name,
+INSERT INTO test_projection_events (
+projection_name,
 global_position,
 stream_type,
 stream_id,
@@ -493,7 +488,7 @@ attempt_no
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
 `, c.name, event.GlobalPosition, event.StreamType, event.StreamID, event.EventType, c.instanceLabel, attemptNo)
 	if err != nil {
-		return fmt.Errorf("insert test consumer row: %w", err)
+		return fmt.Errorf("insert test projection row: %w", err)
 	}
 
 	c.mu.Lock()
@@ -503,39 +498,39 @@ attempt_no
 	return nil
 }
 
-func (c *testConsumer) FailTimes(position int64, attempts int, err error) {
+func (c *testProjection) FailTimes(position int64, attempts int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.failures[position] = failurePlan{err: err, remaining: attempts}
 }
 
-func (c *testConsumer) FailUntilCleared(position int64, err error) {
+func (c *testProjection) FailUntilCleared(position int64, err error) {
 	c.FailTimes(position, -1, err)
 }
 
-func (c *testConsumer) ClearFailure(position int64) {
+func (c *testProjection) ClearFailure(position int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	delete(c.failures, position)
 }
 
-func (c *testConsumer) AttemptCount(position int64) int {
+func (c *testProjection) AttemptCount(position int64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	return c.attempts[position]
 }
 
-func (c *testConsumer) ProcessedCount() int {
+func (c *testProjection) ProcessedCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	return len(c.processedEvents)
 }
 
-func startTestWorker(t *testing.T, label string, consumers []*testConsumer, opts ...workerpkg.Option) *testWorkerHarness {
+func startTestProjector(t *testing.T, label string, projections []*testProjection, opts ...projectorpkg.Option) *testProjectorHarness {
 	t.Helper()
 
 	db := openTestDB(t)
@@ -543,23 +538,27 @@ func startTestWorker(t *testing.T, label string, consumers []*testConsumer, opts
 		db.Close()
 	})
 	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
-	consumerList := make([]consumer.Consumer, 0, len(consumers))
-	for _, consumer := range consumers {
-		consumerList = append(consumerList, consumer)
+	projectionList := make([]projectorpkg.Projection, 0, len(projections))
+	for _, p := range projections {
+		if len(p.streamTypes) > 0 {
+			projectionList = append(projectionList, projectorpkg.FilterStreamTypes(p, p.streamTypes...))
+		} else {
+			projectionList = append(projectionList, p)
+		}
 	}
 
-	w := workerpkg.New(db, eventStore, consumerList, opts...)
+	daemon := projectorpkg.New(db, eventStore, projectionList, opts...)
 	ctx, cancel := context.WithCancel(context.Background())
-	harness := &testWorkerHarness{
+	harness := &testProjectorHarness{
 		label:  label,
 		db:     db,
-		worker: w,
+		daemon: daemon,
 		cancel: cancel,
 		errCh:  make(chan error, 1),
 	}
 
 	go func() {
-		harness.errCh <- w.Start(ctx)
+		harness.errCh <- daemon.Start(ctx)
 	}()
 
 	t.Cleanup(func() {
@@ -571,12 +570,12 @@ func startTestWorker(t *testing.T, label string, consumers []*testConsumer, opts
 		defer cancel()
 
 		var count int
-		err := db.QueryRow(ctx, `SELECT COUNT(*) FROM worker_nodes WHERE worker_id = $1`, w.ID()).Scan(&count)
+		err := db.QueryRow(ctx, `SELECT COUNT(*) FROM projector_instances WHERE instance_id = $1`, daemon.ID()).Scan(&count)
 		if err != nil {
 			return err
 		}
 		if count != 1 {
-			return fmt.Errorf("worker %s not registered yet", label)
+			return fmt.Errorf("projector %s not registered yet", label)
 		}
 		return nil
 	})
@@ -584,36 +583,36 @@ func startTestWorker(t *testing.T, label string, consumers []*testConsumer, opts
 	return harness
 }
 
-func (h *testWorkerHarness) stop(tb testing.TB) {
+func (h *testProjectorHarness) stop(tb testing.TB) {
 	tb.Helper()
 
 	h.stopOnce.Do(func() {
-		h.worker.Stop()
+		h.daemon.Stop()
 		h.cancel()
 
 		select {
 		case err := <-h.errCh:
 			if err != nil &&
 				!errors.Is(err, context.Canceled) &&
-				!errors.Is(err, workerpostgres.ErrWorkerRegistrationMissing) {
-				tb.Fatalf("worker %s stopped with error: %v", h.label, err)
+				!errors.Is(err, projectorpostgres.ErrInstanceRegistrationMissing) {
+				tb.Fatalf("projector %s stopped with error: %v", h.label, err)
 			}
-		case <-time.After(workerShutdownTimeout):
-			tb.Fatalf("timeout waiting for worker %s to stop", h.label)
+		case <-time.After(projectorShutdownTimeout):
+			tb.Fatalf("timeout waiting for projector %s to stop", h.label)
 		}
 	})
 }
 
-func defaultWorkerOptions() []workerpkg.Option {
-	return []workerpkg.Option{
-		workerpkg.WithBatchSize(50),
-		workerpkg.WithPollInterval(50 * time.Millisecond),
-		workerpkg.WithMaxPollInterval(200 * time.Millisecond),
-		workerpkg.WithDispatcherInterval(50 * time.Millisecond),
-		workerpkg.WithHeartbeatInterval(100 * time.Millisecond),
-		workerpkg.WithHeartbeatTimeout(500 * time.Millisecond),
-		workerpkg.WithRebalanceInterval(200 * time.Millisecond),
-		workerpkg.WithBatchPause(10 * time.Millisecond),
+func defaultProjectorOptions() []projectorpkg.Option {
+	return []projectorpkg.Option{
+		projectorpkg.WithBatchSize(50),
+		projectorpkg.WithPollInterval(50 * time.Millisecond),
+		projectorpkg.WithMaxPollInterval(200 * time.Millisecond),
+		projectorpkg.WithDispatcherInterval(50 * time.Millisecond),
+		projectorpkg.WithHeartbeatInterval(100 * time.Millisecond),
+		projectorpkg.WithHeartbeatTimeout(500 * time.Millisecond),
+		projectorpkg.WithRebalanceInterval(200 * time.Millisecond),
+		projectorpkg.WithBatchPause(10 * time.Millisecond),
 	}
 }
 
@@ -639,27 +638,27 @@ func latestGlobalPosition(t testing.TB, db *pgxpool.Pool, eventStore *storepostg
 	return position
 }
 
-func getCheckpoint(t testing.TB, db *pgxpool.Pool, consumerName string) int64 {
+func getCheckpoint(t testing.TB, db *pgxpool.Pool, projectionName string) int64 {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	position, err := workerpostgres.GetCheckpoint(ctx, db, workerpostgres.DefaultConsumerCheckpointsTable, consumerName)
+	position, err := projectorpostgres.GetCheckpoint(ctx, db, projectorpostgres.DefaultProjectionCheckpointsTable, projectionName)
 	if err != nil {
-		t.Fatalf("get checkpoint for %s: %v", consumerName, err)
+		t.Fatalf("get checkpoint for %s: %v", projectionName, err)
 	}
 
 	return position
 }
 
-func getAssignments(t testing.TB, db *pgxpool.Pool) []workerpostgres.ConsumerAssignment {
+func getAssignments(t testing.TB, db *pgxpool.Pool) []projectorpostgres.ProjectionAssignment {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	assignments, err := workerpostgres.GetAssignments(ctx, db, workerpostgres.DefaultConsumerAssignmentsTable)
+	assignments, err := projectorpostgres.GetAssignments(ctx, db, projectorpostgres.DefaultProjectionAssignmentsTable)
 	if err != nil {
 		t.Fatalf("get assignments: %v", err)
 	}
@@ -667,38 +666,38 @@ func getAssignments(t testing.TB, db *pgxpool.Pool) []workerpostgres.ConsumerAss
 	return assignments
 }
 
-func assignedConsumerCounts(assignments []workerpostgres.ConsumerAssignment) map[uuid.UUID]int {
+func assignedProjectionCounts(assignments []projectorpostgres.ProjectionAssignment) map[uuid.UUID]int {
 	counts := make(map[uuid.UUID]int)
 	for _, assignment := range assignments {
 		if assignment.Assigned {
-			counts[assignment.WorkerID]++
+			counts[assignment.InstanceID]++
 		}
 	}
 	return counts
 }
 
-func getHandledRows(t testing.TB, db *pgxpool.Pool, consumerName string) []testConsumerEventRow {
+func getHandledRows(t testing.TB, db *pgxpool.Pool, projectionName string) []testProjectionEventRow {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	rows, err := db.Query(ctx, `
-SELECT consumer_name, global_position, stream_type, stream_id, event_type, handled_by, attempt_no
-FROM test_consumer_events
-WHERE consumer_name = $1
+SELECT projection_name, global_position, stream_type, stream_id, event_type, handled_by, attempt_no
+FROM test_projection_events
+WHERE projection_name = $1
 ORDER BY global_position ASC
-`, consumerName)
+`, projectionName)
 	if err != nil {
-		t.Fatalf("query handled rows for %s: %v", consumerName, err)
+		t.Fatalf("query handled rows for %s: %v", projectionName, err)
 	}
 	defer rows.Close()
 
-	result := make([]testConsumerEventRow, 0)
+	result := make([]testProjectionEventRow, 0)
 	for rows.Next() {
-		var row testConsumerEventRow
+		var row testProjectionEventRow
 		if err := rows.Scan(
-			&row.ConsumerName,
+			&row.ProjectionName,
 			&row.GlobalPosition,
 			&row.StreamType,
 			&row.StreamID,
@@ -706,32 +705,32 @@ ORDER BY global_position ASC
 			&row.HandledBy,
 			&row.AttemptNo,
 		); err != nil {
-			t.Fatalf("scan handled row for %s: %v", consumerName, err)
+			t.Fatalf("scan handled row for %s: %v", projectionName, err)
 		}
 		result = append(result, row)
 	}
 
 	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate handled rows for %s: %v", consumerName, err)
+		t.Fatalf("iterate handled rows for %s: %v", projectionName, err)
 	}
 
 	return result
 }
 
-func getGapSkipRows(t testing.TB, db *pgxpool.Pool, consumerName string) []gapSkipRow {
+func getGapSkipRows(t testing.TB, db *pgxpool.Pool, projectionName string) []gapSkipRow {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	rows, err := db.Query(ctx, `
-SELECT consumer_name, gap_position, skip_to_position, highest_visible_position
-FROM consumer_gap_skips
-WHERE consumer_name = $1
+SELECT projection_name, gap_position, skip_to_position, highest_visible_position
+FROM projection_gap_skips
+WHERE projection_name = $1
 ORDER BY id ASC
-`, consumerName)
+`, projectionName)
 	if err != nil {
-		t.Fatalf("query gap skip rows for %s: %v", consumerName, err)
+		t.Fatalf("query gap skip rows for %s: %v", projectionName, err)
 	}
 	defer rows.Close()
 
@@ -739,17 +738,17 @@ ORDER BY id ASC
 	for rows.Next() {
 		var row gapSkipRow
 		if err := rows.Scan(
-			&row.ConsumerName,
+			&row.ProjectionName,
 			&row.GapPosition,
 			&row.SkipToPosition,
 			&row.HighestVisiblePosition,
 		); err != nil {
-			t.Fatalf("scan gap skip row for %s: %v", consumerName, err)
+			t.Fatalf("scan gap skip row for %s: %v", projectionName, err)
 		}
 		result = append(result, row)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate gap skip rows for %s: %v", consumerName, err)
+		t.Fatalf("iterate gap skip rows for %s: %v", projectionName, err)
 	}
 
 	return result
@@ -763,7 +762,7 @@ func handledByAfter(t testing.TB, db *pgxpool.Pool, cutoff int64) []string {
 
 	rows, err := db.Query(ctx, `
 SELECT DISTINCT handled_by
-FROM test_consumer_events
+FROM test_projection_events
 WHERE global_position > $1
 ORDER BY handled_by ASC
 `, cutoff)
@@ -788,62 +787,62 @@ ORDER BY handled_by ASC
 	return labels
 }
 
-func countWorkerRows(t testing.TB, db *pgxpool.Pool) int {
+func countProjectorRows(t testing.TB, db *pgxpool.Pool) int {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	var count int
-	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM worker_nodes`).Scan(&count); err != nil {
-		t.Fatalf("count worker rows: %v", err)
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM projector_instances`).Scan(&count); err != nil {
+		t.Fatalf("count projector rows: %v", err)
 	}
 
 	return count
 }
 
-func workerRowExists(t testing.TB, db *pgxpool.Pool, workerID uuid.UUID) bool {
+func projectorRowExists(t testing.TB, db *pgxpool.Pool, instanceID uuid.UUID) bool {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	var count int
-	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM worker_nodes WHERE worker_id = $1`, workerID).Scan(&count); err != nil {
-		t.Fatalf("check worker row %s: %v", workerID, err)
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM projector_instances WHERE instance_id = $1`, instanceID).Scan(&count); err != nil {
+		t.Fatalf("check instance row %s: %v", instanceID, err)
 	}
 
 	return count == 1
 }
 
-func insertWorkerRow(t testing.TB, db *pgxpool.Pool, workerID uuid.UUID, heartbeatAt time.Time) {
+func insertProjectorRow(t testing.TB, db *pgxpool.Pool, instanceID uuid.UUID, heartbeatAt time.Time) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	_, err := db.Exec(ctx, `
-INSERT INTO worker_nodes (worker_id, heartbeat_at, created_at, updated_at)
+INSERT INTO projector_instances (instance_id, heartbeat_at, created_at, updated_at)
 VALUES ($1, $2, NOW(), NOW())
-`, workerID, heartbeatAt)
+`, instanceID, heartbeatAt)
 	if err != nil {
-		t.Fatalf("insert worker row %s: %v", workerID, err)
+		t.Fatalf("insert instance row %s: %v", instanceID, err)
 	}
 }
 
-func assignConsumerToWorker(t testing.TB, db *pgxpool.Pool, consumerName string, workerID uuid.UUID) {
+func assignProjectionToInstance(t testing.TB, db *pgxpool.Pool, projectionName string, instanceID uuid.UUID) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	_, err := db.Exec(ctx, `
-UPDATE consumer_assignments
-SET worker_id = $1, updated_at = NOW()
-WHERE consumer_name = $2
-`, workerID, consumerName)
+UPDATE projection_assignments
+SET instance_id = $1, updated_at = NOW()
+WHERE projection_name = $2
+`, instanceID, projectionName)
 	if err != nil {
-		t.Fatalf("assign consumer %s to worker %s: %v", consumerName, workerID, err)
+		t.Fatalf("assign projection %s to instance %s: %v", projectionName, instanceID, err)
 	}
 }
 
@@ -868,24 +867,25 @@ func generateStoreSQL(t testing.TB, outputDir string) []byte {
 	return sqlBytes
 }
 
-func generateWorkerSQL(t testing.TB, outputDir string) []byte {
+func generateProjectorSQL(t testing.TB, outputDir string) []byte {
 	t.Helper()
 
-	config := &workermigrations.Config{
-		OutputFolder:             outputDir,
-		OutputFilename:           "worker.sql",
-		WorkerNodesTable:         workerpostgres.DefaultWorkerNodesTable,
-		ConsumerAssignmentsTable: workerpostgres.DefaultConsumerAssignmentsTable,
-		ConsumerCheckpointsTable: workerpostgres.DefaultConsumerCheckpointsTable,
-		LeaderElectionTable:      workerpostgres.DefaultLeaderElectionTable,
+	config := &projectormigrations.Config{
+		OutputFolder:               outputDir,
+		OutputFilename:             "projector.sql",
+		ProjectorInstancesTable:    projectorpostgres.DefaultProjectorInstancesTable,
+		ProjectionAssignmentsTable: projectorpostgres.DefaultProjectionAssignmentsTable,
+		ProjectionCheckpointsTable: projectorpostgres.DefaultProjectionCheckpointsTable,
+		ProjectionGapSkipsTable:    projectorpostgres.DefaultProjectionGapSkipsTable,
+		ProjectorLeaderLeasesTable: projectorpostgres.DefaultProjectorLeaderLeasesTable,
 	}
-	if err := workermigrations.GeneratePostgres(config); err != nil {
-		t.Fatalf("generate worker migration: %v", err)
+	if err := projectormigrations.GeneratePostgres(config); err != nil {
+		t.Fatalf("generate projector migration: %v", err)
 	}
 
 	sqlBytes, err := os.ReadFile(fmt.Sprintf("%s/%s", outputDir, config.OutputFilename))
 	if err != nil {
-		t.Fatalf("read worker migration: %v", err)
+		t.Fatalf("read projector migration: %v", err)
 	}
 
 	return sqlBytes

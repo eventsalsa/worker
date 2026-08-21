@@ -14,7 +14,7 @@ import (
 
 	storepostgres "github.com/eventsalsa/store/postgres"
 
-	workerpostgres "github.com/eventsalsa/worker/postgres"
+	projectorpostgres "github.com/eventsalsa/projector/postgres"
 )
 
 func TestComprehensiveScaleUpAndDown(t *testing.T) {
@@ -25,20 +25,20 @@ func TestComprehensiveScaleUpAndDown(t *testing.T) {
 
 	eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
 
-	consumerNames := make([]string, 25)
-	for i := range consumerNames {
-		consumerNames[i] = fmt.Sprintf("consumer-%02d", i+1)
+	projectionNames := make([]string, 25)
+	for i := range projectionNames {
+		projectionNames[i] = fmt.Sprintf("projection-%02d", i+1)
 	}
 
-	makeConsumers := func(workerLabel string) []*testConsumer {
-		consumers := make([]*testConsumer, 0, len(consumerNames))
-		for _, consumerName := range consumerNames {
-			consumers = append(consumers, newTestConsumer(consumerName, workerLabel, nil))
+	makeProjections := func(instanceLabel string) []*testProjection {
+		projections := make([]*testProjection, 0, len(projectionNames))
+		for _, projectionName := range projectionNames {
+			projections = append(projections, newTestProjection(projectionName, instanceLabel, nil))
 		}
-		return consumers
+		return projections
 	}
 
-	activeWorkers := make([]*testWorkerHarness, 0, 7)
+	activeProjectors := make([]*testProjectorHarness, 0, 7)
 	allPositions := make([]int64, 0, 30)
 
 	runRebalanceAssertions := func() {
@@ -46,24 +46,24 @@ func TestComprehensiveScaleUpAndDown(t *testing.T) {
 
 		time.Sleep(2 * time.Second)
 
-		workerIDs := workerIDsFromHarnesses(activeWorkers)
+		instanceIDs := instanceIDsFromHarnesses(activeProjectors)
 		waitForErr(t, defaultWaitTimeout, func() error {
-			if err := checkBalancedAssignments(t, controlDB, len(activeWorkers), len(consumerNames), workerIDs); err != nil {
+			if err := checkBalancedAssignments(t, controlDB, len(activeProjectors), len(projectionNames), instanceIDs); err != nil {
 				return err
 			}
-			if err := checkFreshHeartbeats(controlDB, workerIDs, 2*time.Second); err != nil {
+			if err := checkFreshHeartbeats(controlDB, instanceIDs, 2*time.Second); err != nil {
 				return err
 			}
 			if len(allPositions) > 0 {
 				latest := allPositions[len(allPositions)-1]
-				if err := checkConsumersCaughtUp(t, controlDB, consumerNames, len(allPositions), latest); err != nil {
+				if err := checkProjectionsCaughtUp(t, controlDB, projectionNames, len(allPositions), latest); err != nil {
 					return err
 				}
 			}
 			return nil
 		})
 
-		assertBalancedAssignments(t, controlDB, len(activeWorkers), len(consumerNames), workerIDs)
+		assertBalancedAssignments(t, controlDB, len(activeProjectors), len(projectionNames), instanceIDs)
 	}
 
 	runProcessingStep := func(streamType string, expectedLabels []string) {
@@ -82,147 +82,147 @@ func TestComprehensiveScaleUpAndDown(t *testing.T) {
 		expectedCount := len(allPositions)
 
 		waitForErr(t, defaultWaitTimeout, func() error {
-			return checkConsumersProcessedStep(t, controlDB, consumerNames, expectedCount, latest, cutoff, expectedLabels)
+			return checkProjectionsProcessedStep(t, controlDB, projectionNames, expectedCount, latest, cutoff, expectedLabels)
 		})
 	}
 
-	worker1 := startTestWorker(t, "worker-1", makeConsumers("worker-1"), defaultWorkerOptions()...)
-	activeWorkers = append(activeWorkers, worker1)
+	projector1 := startTestProjector(t, "projector-1", makeProjections("projector-1"), defaultProjectorOptions()...)
+	activeProjectors = append(activeProjectors, projector1)
 	runRebalanceAssertions()
-	runProcessingStep("ScaleUp01", []string{"worker-1"})
+	runProcessingStep("ScaleUp01", []string{"projector-1"})
 
-	worker2 := startTestWorker(t, "worker-2", makeConsumers("worker-2"), defaultWorkerOptions()...)
-	activeWorkers = append(activeWorkers, worker2)
+	projector2 := startTestProjector(t, "projector-2", makeProjections("projector-2"), defaultProjectorOptions()...)
+	activeProjectors = append(activeProjectors, projector2)
 	runRebalanceAssertions()
-	runProcessingStep("ScaleUp02", workerLabelsFromHarnesses(activeWorkers))
+	runProcessingStep("ScaleUp02", projectorLabelsFromHarnesses(activeProjectors))
 
-	worker3 := startTestWorker(t, "worker-3", makeConsumers("worker-3"), defaultWorkerOptions()...)
-	activeWorkers = append(activeWorkers, worker3)
+	projector3 := startTestProjector(t, "projector-3", makeProjections("projector-3"), defaultProjectorOptions()...)
+	activeProjectors = append(activeProjectors, projector3)
 	runRebalanceAssertions()
-	runProcessingStep("ScaleUp03", workerLabelsFromHarnesses(activeWorkers))
+	runProcessingStep("ScaleUp03", projectorLabelsFromHarnesses(activeProjectors))
 
-	worker4 := startTestWorker(t, "worker-4", makeConsumers("worker-4"), defaultWorkerOptions()...)
-	worker5 := startTestWorker(t, "worker-5", makeConsumers("worker-5"), defaultWorkerOptions()...)
-	activeWorkers = append(activeWorkers, worker4, worker5)
+	projector4 := startTestProjector(t, "projector-4", makeProjections("projector-4"), defaultProjectorOptions()...)
+	projector5 := startTestProjector(t, "projector-5", makeProjections("projector-5"), defaultProjectorOptions()...)
+	activeProjectors = append(activeProjectors, projector4, projector5)
 	runRebalanceAssertions()
-	runProcessingStep("ScaleUp04", workerLabelsFromHarnesses(activeWorkers))
+	runProcessingStep("ScaleUp04", projectorLabelsFromHarnesses(activeProjectors))
 
-	worker6 := startTestWorker(t, "worker-6", makeConsumers("worker-6"), defaultWorkerOptions()...)
-	worker7 := startTestWorker(t, "worker-7", makeConsumers("worker-7"), defaultWorkerOptions()...)
-	activeWorkers = append(activeWorkers, worker6, worker7)
+	projector6 := startTestProjector(t, "projector-6", makeProjections("projector-6"), defaultProjectorOptions()...)
+	projector7 := startTestProjector(t, "projector-7", makeProjections("projector-7"), defaultProjectorOptions()...)
+	activeProjectors = append(activeProjectors, projector6, projector7)
 	runRebalanceAssertions()
-	runProcessingStep("ScaleUp05", workerLabelsFromHarnesses(activeWorkers))
+	runProcessingStep("ScaleUp05", projectorLabelsFromHarnesses(activeProjectors))
 
 	waitForErr(t, defaultWaitTimeout, func() error {
-		return checkFreshHeartbeats(controlDB, workerIDsFromHarnesses(activeWorkers), 2*time.Second)
+		return checkFreshHeartbeats(controlDB, instanceIDsFromHarnesses(activeProjectors), 2*time.Second)
 	})
 
-	worker6.stop(t)
-	worker7.stop(t)
-	activeWorkers = []*testWorkerHarness{worker1, worker2, worker3, worker4, worker5}
+	projector6.stop(t)
+	projector7.stop(t)
+	activeProjectors = []*testProjectorHarness{projector1, projector2, projector3, projector4, projector5}
 	runRebalanceAssertions()
 
-	worker4.stop(t)
-	worker5.stop(t)
-	activeWorkers = []*testWorkerHarness{worker1, worker2, worker3}
+	projector4.stop(t)
+	projector5.stop(t)
+	activeProjectors = []*testProjectorHarness{projector1, projector2, projector3}
 	runRebalanceAssertions()
 
-	worker2.stop(t)
-	worker3.stop(t)
-	activeWorkers = []*testWorkerHarness{worker1}
+	projector2.stop(t)
+	projector3.stop(t)
+	activeProjectors = []*testProjectorHarness{projector1}
 	runRebalanceAssertions()
-	runProcessingStep("ScaleDownFinal", []string{"worker-1"})
+	runProcessingStep("ScaleDownFinal", []string{"projector-1"})
 
 	latest := allPositions[len(allPositions)-1]
 	if position := latestGlobalPosition(t, controlDB, eventStore); position != latest {
 		t.Fatalf("latest global position=%d want %d", position, latest)
 	}
 
-	assertAllEventsProcessedWithoutGaps(t, controlDB, consumerNames, allPositions, latest)
+	assertAllEventsProcessedWithoutGaps(t, controlDB, projectionNames, allPositions, latest)
 }
 
-func assertBalancedAssignments(t *testing.T, db *pgxpool.Pool, expectedWorkers int, totalConsumers int, workerIDs []uuid.UUID) {
+func assertBalancedAssignments(t *testing.T, db *pgxpool.Pool, expectedInstances int, totalProjections int, instanceIDs []uuid.UUID) {
 	t.Helper()
 
-	if err := checkBalancedAssignments(t, db, expectedWorkers, totalConsumers, workerIDs); err != nil {
+	if err := checkBalancedAssignments(t, db, expectedInstances, totalProjections, instanceIDs); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func checkBalancedAssignments(t *testing.T, db *pgxpool.Pool, expectedWorkers int, totalConsumers int, workerIDs []uuid.UUID) error {
+func checkBalancedAssignments(t *testing.T, db *pgxpool.Pool, expectedInstances int, totalProjections int, instanceIDs []uuid.UUID) error {
 	t.Helper()
 
 	assignments := getAssignments(t, db)
-	if len(assignments) != totalConsumers {
-		return fmt.Errorf("assignment rows=%d want %d", len(assignments), totalConsumers)
+	if len(assignments) != totalProjections {
+		return fmt.Errorf("assignment rows=%d want %d", len(assignments), totalProjections)
 	}
 
-	expectedSet := make(map[uuid.UUID]struct{}, len(workerIDs))
-	for _, workerID := range workerIDs {
-		expectedSet[workerID] = struct{}{}
+	expectedSet := make(map[uuid.UUID]struct{}, len(instanceIDs))
+	for _, instanceID := range instanceIDs {
+		expectedSet[instanceID] = struct{}{}
 	}
 
 	assignedCount := 0
 	for _, assignment := range assignments {
 		if !assignment.Assigned {
-			return fmt.Errorf("consumer %s is unassigned", assignment.ConsumerName)
+			return fmt.Errorf("projection %s is unassigned", assignment.ProjectionName)
 		}
-		if _, ok := expectedSet[assignment.WorkerID]; !ok {
-			return fmt.Errorf("consumer %s assigned to unexpected worker %s", assignment.ConsumerName, assignment.WorkerID)
+		if _, ok := expectedSet[assignment.InstanceID]; !ok {
+			return fmt.Errorf("projection %s assigned to unexpected instance %s", assignment.ProjectionName, assignment.InstanceID)
 		}
 		assignedCount++
 	}
-	if assignedCount != totalConsumers {
-		return fmt.Errorf("assigned consumers=%d want %d", assignedCount, totalConsumers)
+	if assignedCount != totalProjections {
+		return fmt.Errorf("assigned projections=%d want %d", assignedCount, totalProjections)
 	}
 
-	counts := assignedConsumerCounts(assignments)
-	if len(counts) != expectedWorkers {
-		return fmt.Errorf("assigned workers=%d want %d (counts=%v)", len(counts), expectedWorkers, counts)
+	counts := assignedProjectionCounts(assignments)
+	if len(counts) != expectedInstances {
+		return fmt.Errorf("assigned instances=%d want %d (counts=%v)", len(counts), expectedInstances, counts)
 	}
 
-	minPerWorker := totalConsumers / expectedWorkers
-	maxPerWorker := minPerWorker
-	if totalConsumers%expectedWorkers != 0 {
-		maxPerWorker++
+	minPerInstance := totalProjections / expectedInstances
+	maxPerInstance := minPerInstance
+	if totalProjections%expectedInstances != 0 {
+		maxPerInstance++
 	}
 
 	totalAssigned := 0
-	for _, workerID := range workerIDs {
-		count := counts[workerID]
-		if count < minPerWorker || count > maxPerWorker {
+	for _, instanceID := range instanceIDs {
+		count := counts[instanceID]
+		if count < minPerInstance || count > maxPerInstance {
 			return fmt.Errorf(
-				"worker %s has %d consumers, want %d or %d (counts=%v)",
-				workerID,
+				"instance %s has %d projections, want %d or %d (counts=%v)",
+				instanceID,
 				count,
-				minPerWorker,
-				maxPerWorker,
+				minPerInstance,
+				maxPerInstance,
 				counts,
 			)
 		}
 		totalAssigned += count
 	}
-	if totalAssigned != totalConsumers {
-		return fmt.Errorf("total assigned=%d want %d", totalAssigned, totalConsumers)
+	if totalAssigned != totalProjections {
+		return fmt.Errorf("total assigned=%d want %d", totalAssigned, totalProjections)
 	}
 
 	return nil
 }
 
-func assertAllEventsProcessedWithoutGaps(t *testing.T, db *pgxpool.Pool, consumerNames []string, expectedPositions []int64, latest int64) {
+func assertAllEventsProcessedWithoutGaps(t *testing.T, db *pgxpool.Pool, projectionNames []string, expectedPositions []int64, latest int64) {
 	t.Helper()
 
-	for _, consumerName := range consumerNames {
-		rows := getHandledRows(t, db, consumerName)
+	for _, projectionName := range projectionNames {
+		rows := getHandledRows(t, db, projectionName)
 		if len(rows) != len(expectedPositions) {
-			t.Fatalf("%s handled %d rows, want %d", consumerName, len(rows), len(expectedPositions))
+			t.Fatalf("%s handled %d rows, want %d", projectionName, len(rows), len(expectedPositions))
 		}
 
 		for index, position := range expectedPositions {
 			if rows[index].GlobalPosition != position {
 				t.Fatalf(
 					"%s row %d has global_position=%d want %d",
-					consumerName,
+					projectionName,
 					index,
 					rows[index].GlobalPosition,
 					position,
@@ -230,16 +230,16 @@ func assertAllEventsProcessedWithoutGaps(t *testing.T, db *pgxpool.Pool, consume
 			}
 		}
 
-		if checkpoint := getCheckpoint(t, db, consumerName); checkpoint != latest {
-			t.Fatalf("%s checkpoint=%d want %d", consumerName, checkpoint, latest)
+		if checkpoint := getCheckpoint(t, db, projectionName); checkpoint != latest {
+			t.Fatalf("%s checkpoint=%d want %d", projectionName, checkpoint, latest)
 		}
 	}
 }
 
-func checkConsumersProcessedStep(t *testing.T, db *pgxpool.Pool, consumerNames []string, expectedCount int, latest int64, cutoff int64, expectedLabels []string) error {
+func checkProjectionsProcessedStep(t *testing.T, db *pgxpool.Pool, projectionNames []string, expectedCount int, latest int64, cutoff int64, expectedLabels []string) error {
 	t.Helper()
 
-	if err := checkConsumersCaughtUp(t, db, consumerNames, expectedCount, latest); err != nil {
+	if err := checkProjectionsCaughtUp(t, db, projectionNames, expectedCount, latest); err != nil {
 		return err
 	}
 
@@ -261,98 +261,98 @@ func checkConsumersProcessedStep(t *testing.T, db *pgxpool.Pool, consumerNames [
 	return nil
 }
 
-func checkConsumersCaughtUp(t *testing.T, db *pgxpool.Pool, consumerNames []string, expectedCount int, latest int64) error {
+func checkProjectionsCaughtUp(t *testing.T, db *pgxpool.Pool, projectionNames []string, expectedCount int, latest int64) error {
 	t.Helper()
 
-	for _, consumerName := range consumerNames {
-		rows := getHandledRows(t, db, consumerName)
+	for _, projectionName := range projectionNames {
+		rows := getHandledRows(t, db, projectionName)
 		if len(rows) != expectedCount {
-			return fmt.Errorf("%s handled %d rows, want %d", consumerName, len(rows), expectedCount)
+			return fmt.Errorf("%s handled %d rows, want %d", projectionName, len(rows), expectedCount)
 		}
-		if checkpoint := getCheckpoint(t, db, consumerName); checkpoint != latest {
-			return fmt.Errorf("%s checkpoint=%d want %d", consumerName, checkpoint, latest)
+		if checkpoint := getCheckpoint(t, db, projectionName); checkpoint != latest {
+			return fmt.Errorf("%s checkpoint=%d want %d", projectionName, checkpoint, latest)
 		}
 	}
 
 	return nil
 }
 
-func checkFreshHeartbeats(db *pgxpool.Pool, workerIDs []uuid.UUID, maxAge time.Duration) error {
+func checkFreshHeartbeats(db *pgxpool.Pool, instanceIDs []uuid.UUID, maxAge time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	query := fmt.Sprintf(`
-SELECT worker_id, heartbeat_at
+SELECT instance_id, heartbeat_at
 FROM %s
-ORDER BY worker_id ASC
-`, workerpostgres.DefaultWorkerNodesTable)
+ORDER BY instance_id ASC
+`, projectorpostgres.DefaultProjectorInstancesTable)
 
 	rows, err := db.Query(ctx, query)
 	if err != nil {
-		return fmt.Errorf("query worker heartbeats: %w", err)
+		return fmt.Errorf("query instance heartbeats: %w", err)
 	}
 	defer rows.Close()
 
-	expectedSet := make(map[uuid.UUID]struct{}, len(workerIDs))
-	for _, workerID := range workerIDs {
-		expectedSet[workerID] = struct{}{}
+	expectedSet := make(map[uuid.UUID]struct{}, len(instanceIDs))
+	for _, instanceID := range instanceIDs {
+		expectedSet[instanceID] = struct{}{}
 	}
 
-	heartbeats := make(map[uuid.UUID]time.Time, len(workerIDs))
+	heartbeats := make(map[uuid.UUID]time.Time, len(instanceIDs))
 	for rows.Next() {
-		var workerIDStr string
+		var instanceIDStr string
 		var heartbeatAt time.Time
-		if err := rows.Scan(&workerIDStr, &heartbeatAt); err != nil {
-			return fmt.Errorf("scan worker heartbeat: %w", err)
+		if err := rows.Scan(&instanceIDStr, &heartbeatAt); err != nil {
+			return fmt.Errorf("scan instance heartbeat: %w", err)
 		}
 
-		workerID, err := uuid.Parse(workerIDStr)
+		instanceID, err := uuid.Parse(instanceIDStr)
 		if err != nil {
-			return fmt.Errorf("parse worker id %q: %w", workerIDStr, err)
+			return fmt.Errorf("parse instance id %q: %w", instanceIDStr, err)
 		}
 
-		heartbeats[workerID] = heartbeatAt
+		heartbeats[instanceID] = heartbeatAt
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate worker heartbeats: %w", err)
+		return fmt.Errorf("iterate instance heartbeats: %w", err)
 	}
 
-	if len(heartbeats) != len(workerIDs) {
-		return fmt.Errorf("worker_nodes rows=%d want %d", len(heartbeats), len(workerIDs))
+	if len(heartbeats) != len(instanceIDs) {
+		return fmt.Errorf("projector_instances rows=%d want %d", len(heartbeats), len(instanceIDs))
 	}
 
 	now := time.Now()
-	for _, workerID := range workerIDs {
-		heartbeatAt, ok := heartbeats[workerID]
+	for _, instanceID := range instanceIDs {
+		heartbeatAt, ok := heartbeats[instanceID]
 		if !ok {
-			return fmt.Errorf("worker %s missing from worker_nodes", workerID)
+			return fmt.Errorf("instance %s missing from projector_instances", instanceID)
 		}
 		if age := now.Sub(heartbeatAt); age > maxAge {
-			return fmt.Errorf("worker %s heartbeat age=%s exceeds %s", workerID, age, maxAge)
+			return fmt.Errorf("instance %s heartbeat age=%s exceeds %s", instanceID, age, maxAge)
 		}
 	}
 
-	for workerID := range heartbeats {
-		if _, ok := expectedSet[workerID]; !ok {
-			return fmt.Errorf("unexpected worker %s present in worker_nodes", workerID)
+	for instanceID := range heartbeats {
+		if _, ok := expectedSet[instanceID]; !ok {
+			return fmt.Errorf("unexpected instance %s present in projector_instances", instanceID)
 		}
 	}
 
 	return nil
 }
 
-func workerIDsFromHarnesses(workers []*testWorkerHarness) []uuid.UUID {
-	ids := make([]uuid.UUID, 0, len(workers))
-	for _, worker := range workers {
-		ids = append(ids, worker.worker.ID())
+func instanceIDsFromHarnesses(projectors []*testProjectorHarness) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(projectors))
+	for _, projector := range projectors {
+		ids = append(ids, projector.daemon.ID())
 	}
 	return ids
 }
 
-func workerLabelsFromHarnesses(workers []*testWorkerHarness) []string {
-	labels := make([]string, 0, len(workers))
-	for _, worker := range workers {
-		labels = append(labels, worker.label)
+func projectorLabelsFromHarnesses(projectors []*testProjectorHarness) []string {
+	labels := make([]string, 0, len(projectors))
+	for _, projector := range projectors {
+		labels = append(labels, projector.label)
 	}
 	return labels
 }

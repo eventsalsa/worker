@@ -1,4 +1,4 @@
-// Package postgres provides PostgreSQL implementations for worker infrastructure.
+// Package postgres provides PostgreSQL implementations for projector infrastructure.
 package postgres
 
 import "github.com/lib/pq"
