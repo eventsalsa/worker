@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Config configures worker migration generation.
+// Config configures projector migration generation.
 type Config struct {
 	// OutputFolder is the directory where the migration file will be written.
 	OutputFolder string
@@ -16,20 +16,20 @@ type Config struct {
 	// OutputFilename is the name of the migration file.
 	OutputFilename string
 
-	// WorkerNodesTable is the name of the worker registration table.
-	WorkerNodesTable string
+	// ProjectorInstancesTable is the name of the projector instance registration table.
+	ProjectorInstancesTable string
 
-	// ConsumerAssignmentsTable is the name of the consumer assignment table.
-	ConsumerAssignmentsTable string
+	// ProjectionAssignmentsTable is the name of the projection assignment table.
+	ProjectionAssignmentsTable string
 
-	// ConsumerCheckpointsTable is the name of the consumer checkpoint table.
-	ConsumerCheckpointsTable string
+	// ProjectionCheckpointsTable is the name of the projection checkpoint table.
+	ProjectionCheckpointsTable string
 
-	// ConsumerGapSkipsTable is the name of the consumer gap skip audit table.
-	ConsumerGapSkipsTable string
+	// ProjectionGapSkipsTable is the name of the projection gap skip audit table.
+	ProjectionGapSkipsTable string
 
-	// LeaderElectionTable is the name of the leader election lease table.
-	LeaderElectionTable string
+	// ProjectorLeaderLeasesTable is the name of the leader election lease table.
+	ProjectorLeaderLeasesTable string
 }
 
 // DefaultConfig returns the default configuration.
@@ -37,13 +37,13 @@ func DefaultConfig() Config {
 	timestamp := time.Now().Format("20060102150405")
 
 	return Config{
-		OutputFolder:             "migrations",
-		OutputFilename:           fmt.Sprintf("%s_init_worker_infrastructure.sql", timestamp),
-		WorkerNodesTable:         "worker_nodes",
-		ConsumerAssignmentsTable: "consumer_assignments",
-		ConsumerCheckpointsTable: "consumer_checkpoints",
-		ConsumerGapSkipsTable:    "consumer_gap_skips",
-		LeaderElectionTable:      "worker_leader_election",
+		OutputFolder:               "migrations",
+		OutputFilename:             fmt.Sprintf("%s_init_projector_infrastructure.sql", timestamp),
+		ProjectorInstancesTable:    "projector_instances",
+		ProjectionAssignmentsTable: "projection_assignments",
+		ProjectionCheckpointsTable: "projection_checkpoints",
+		ProjectionGapSkipsTable:    "projection_gap_skips",
+		ProjectorLeaderLeasesTable: "projector_leader_leases",
 	}
 }
 
@@ -69,25 +69,25 @@ func generatePostgresSQL(config *Config) string {
 	normalized := normalizeConfig(config)
 
 	schemaDDL := schemaStatements(
-		normalized.WorkerNodesTable,
-		normalized.ConsumerAssignmentsTable,
-		normalized.ConsumerCheckpointsTable,
-		normalized.ConsumerGapSkipsTable,
-		normalized.LeaderElectionTable,
+		normalized.ProjectorInstancesTable,
+		normalized.ProjectionAssignmentsTable,
+		normalized.ProjectionCheckpointsTable,
+		normalized.ProjectionGapSkipsTable,
+		normalized.ProjectorLeaderLeasesTable,
 	)
 
-	return fmt.Sprintf(`-- Worker Infrastructure Migration
+	return fmt.Sprintf(`-- Projector Infrastructure Migration
 -- Generated: %s
 --
--- These tables coordinate distributed worker execution:
--- - %s tracks worker nodes and heartbeats
--- - %s maps consumers to worker nodes
--- - %s stores each consumer's last processed global position
+-- These tables coordinate distributed projection execution:
+-- - %s tracks projector instances and heartbeats
+-- - %s maps projections to projector instances
+-- - %s stores each projection's last processed global position
 -- - %s stores durable stale-gap advancement records
 -- - %s manages active leader leases
 %s
 CREATE TABLE IF NOT EXISTS %s (
-    worker_id UUID PRIMARY KEY,
+    instance_id UUID PRIMARY KEY,
     heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -97,17 +97,17 @@ CREATE INDEX IF NOT EXISTS idx_%s_heartbeat
     ON %s (heartbeat_at);
 
 CREATE TABLE IF NOT EXISTS %s (
-    consumer_name TEXT PRIMARY KEY,
-    worker_id UUID REFERENCES %s(worker_id) ON DELETE SET NULL,
+    projection_name TEXT PRIMARY KEY,
+    instance_id UUID REFERENCES %s(instance_id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_%s_worker
-    ON %s (worker_id);
+CREATE INDEX IF NOT EXISTS idx_%s_instance
+    ON %s (instance_id);
 
 CREATE TABLE IF NOT EXISTS %s (
-    consumer_name TEXT PRIMARY KEY,
+    projection_name TEXT PRIMARY KEY,
     last_position BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -115,8 +115,8 @@ CREATE TABLE IF NOT EXISTS %s (
 
 CREATE TABLE IF NOT EXISTS %s (
     id BIGSERIAL PRIMARY KEY,
-    consumer_name TEXT NOT NULL,
-    worker_id UUID NOT NULL,
+    projection_name TEXT NOT NULL,
+    instance_id UUID NOT NULL,
     gap_position BIGINT NOT NULL,
     skip_to_position BIGINT NOT NULL,
     highest_visible_position BIGINT NOT NULL,
@@ -124,34 +124,34 @@ CREATE TABLE IF NOT EXISTS %s (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_%s_consumer
-    ON %s (consumer_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_%s_projection
+    ON %s (projection_name, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS %s (
     lease_key TEXT PRIMARY KEY,
-    leader_id UUID REFERENCES %s(worker_id) ON DELETE CASCADE,
+    leader_id UUID REFERENCES %s(instance_id) ON DELETE CASCADE,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `,
 		time.Now().Format(time.RFC3339),
-		normalized.WorkerNodesTable,
-		normalized.ConsumerAssignmentsTable,
-		normalized.ConsumerCheckpointsTable,
-		normalized.ConsumerGapSkipsTable,
-		normalized.LeaderElectionTable,
+		normalized.ProjectorInstancesTable,
+		normalized.ProjectionAssignmentsTable,
+		normalized.ProjectionCheckpointsTable,
+		normalized.ProjectionGapSkipsTable,
+		normalized.ProjectorLeaderLeasesTable,
 		schemaDDL,
-		normalized.WorkerNodesTable,
-		indexNameComponent(normalized.WorkerNodesTable), normalized.WorkerNodesTable,
-		normalized.ConsumerAssignmentsTable,
-		normalized.WorkerNodesTable,
-		indexNameComponent(normalized.ConsumerAssignmentsTable), normalized.ConsumerAssignmentsTable,
-		normalized.ConsumerCheckpointsTable,
-		normalized.ConsumerGapSkipsTable,
-		indexNameComponent(normalized.ConsumerGapSkipsTable), normalized.ConsumerGapSkipsTable,
-		normalized.LeaderElectionTable,
-		normalized.WorkerNodesTable,
+		normalized.ProjectorInstancesTable,
+		indexNameComponent(normalized.ProjectorInstancesTable), normalized.ProjectorInstancesTable,
+		normalized.ProjectionAssignmentsTable,
+		normalized.ProjectorInstancesTable,
+		indexNameComponent(normalized.ProjectionAssignmentsTable), normalized.ProjectionAssignmentsTable,
+		normalized.ProjectionCheckpointsTable,
+		normalized.ProjectionGapSkipsTable,
+		indexNameComponent(normalized.ProjectionGapSkipsTable), normalized.ProjectionGapSkipsTable,
+		normalized.ProjectorLeaderLeasesTable,
+		normalized.ProjectorInstancesTable,
 	)
 }
 
@@ -167,20 +167,20 @@ func normalizeConfig(config *Config) Config {
 	if config.OutputFilename != "" {
 		normalized.OutputFilename = config.OutputFilename
 	}
-	if config.WorkerNodesTable != "" {
-		normalized.WorkerNodesTable = config.WorkerNodesTable
+	if config.ProjectorInstancesTable != "" {
+		normalized.ProjectorInstancesTable = config.ProjectorInstancesTable
 	}
-	if config.ConsumerAssignmentsTable != "" {
-		normalized.ConsumerAssignmentsTable = config.ConsumerAssignmentsTable
+	if config.ProjectionAssignmentsTable != "" {
+		normalized.ProjectionAssignmentsTable = config.ProjectionAssignmentsTable
 	}
-	if config.ConsumerCheckpointsTable != "" {
-		normalized.ConsumerCheckpointsTable = config.ConsumerCheckpointsTable
+	if config.ProjectionCheckpointsTable != "" {
+		normalized.ProjectionCheckpointsTable = config.ProjectionCheckpointsTable
 	}
-	if config.ConsumerGapSkipsTable != "" {
-		normalized.ConsumerGapSkipsTable = config.ConsumerGapSkipsTable
+	if config.ProjectionGapSkipsTable != "" {
+		normalized.ProjectionGapSkipsTable = config.ProjectionGapSkipsTable
 	}
-	if config.LeaderElectionTable != "" {
-		normalized.LeaderElectionTable = config.LeaderElectionTable
+	if config.ProjectorLeaderLeasesTable != "" {
+		normalized.ProjectorLeaderLeasesTable = config.ProjectorLeaderLeasesTable
 	}
 
 	return normalized

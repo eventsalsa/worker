@@ -1,6 +1,6 @@
 # Agent Configuration
 
-This repository is configured for use with agentic coding assistants. All development operations, task planning, and testing should leverage the specialized skills defined in the `.agents/` directory.
+This repository is configured for use with agentic coding assistants. All development operations, task planning, and testing should follow the conventions and verification rules defined below.
 
 ## Git Conventions
 
@@ -21,7 +21,7 @@ All contributors (including AI agents) must strictly follow these git practices:
    feat(leader): migrate to lease-based leader election
 
    Migrates the leader election coordination from session-level advisory locks
-   to a lease-based table heartbeat mechanism. This ensures the worker can run
+   to a lease-based table heartbeat mechanism. This ensures the daemon can run
    safely behind PgBouncer in transaction pooling mode.
    ```
 
@@ -35,13 +35,3 @@ Anytime code is touched, the agent is required to run all checks prior to commit
   ```
 - **Rule Reference:** Always prefix shell commands with `rtk` as defined in the [RTK rules](.agents/rules/antigravity-rtk-rules.md).
 - **Exceptions:** The only exception to running these checks is when the changes are made *exclusively* to markdown (`.md`) files.
-
-## Repository Skills
-
-Granular agent skills are located in the [.agents/skills/](.agents/skills) directory:
-
-- [Go Concurrency & Graceful Shutdown](.agents/skills/go-concurrency/SKILL.md) — Safe concurrency patterns, context propagation, and goroutine cleanup.
-- [PostgreSQL Coordination & Transactional Integrity](.agents/skills/postgres-coordination/SKILL.md) — Postgres locks, transactions, checkpoint safety, and serialization retries.
-- [Event Sourcing & Worker Coordination](.agents/skills/event-sourcing-worker/SKILL.md) — Marten-style coordination, rebalancing, and checkpointing.
-- [Go Testing & Integration with PostgreSQL](.agents/skills/go-testing-postgres/SKILL.md) — Testcontainers-go, unit testing, and async polling assertions.
-- [Correctness & Concurrency Code Review](.agents/skills/code-review/SKILL.md) — Rules for PR reviews, focusing on bugs and API consistency.

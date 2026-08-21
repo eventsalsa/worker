@@ -23,7 +23,7 @@ lint: ## Run linter
 
 fmt: ## Format code
 	gofmt -w -s .
-	goimports -w -local github.com/eventsalsa/worker .
+	goimports -w -local github.com/eventsalsa/projector .
 
 build: ## Build all packages
 	go build -v ./...

@@ -6,48 +6,48 @@ import (
 	"github.com/google/uuid"
 )
 
-// ComputeAssignments distributes consumers evenly across workers.
-// It sorts consumers alphabetically and workers by UUID string before assigning in round-robin order.
-func ComputeAssignments(consumerNames []string, workerIDs []uuid.UUID) map[string]uuid.UUID {
-	if len(consumerNames) == 0 || len(workerIDs) == 0 {
+// ComputeAssignments distributes projections evenly across instances.
+// It sorts projections alphabetically and instances by UUID string before assigning in round-robin order.
+func ComputeAssignments(projectionNames []string, instanceIDs []uuid.UUID) map[string]uuid.UUID {
+	if len(projectionNames) == 0 || len(instanceIDs) == 0 {
 		return map[string]uuid.UUID{}
 	}
 
-	sortedConsumers := append([]string(nil), consumerNames...)
-	sort.Strings(sortedConsumers)
+	sortedProjections := append([]string(nil), projectionNames...)
+	sort.Strings(sortedProjections)
 
-	sortedWorkers := append([]uuid.UUID(nil), workerIDs...)
-	sort.Slice(sortedWorkers, func(i, j int) bool {
-		return sortedWorkers[i].String() < sortedWorkers[j].String()
+	sortedInstances := append([]uuid.UUID(nil), instanceIDs...)
+	sort.Slice(sortedInstances, func(i, j int) bool {
+		return sortedInstances[i].String() < sortedInstances[j].String()
 	})
 
-	assignments := make(map[string]uuid.UUID, len(sortedConsumers))
-	for index, consumerName := range sortedConsumers {
-		assignments[consumerName] = sortedWorkers[index%len(sortedWorkers)]
+	assignments := make(map[string]uuid.UUID, len(sortedProjections))
+	for index, projectionName := range sortedProjections {
+		assignments[projectionName] = sortedInstances[index%len(sortedInstances)]
 	}
 
 	return assignments
 }
 
 // NeedsRebalance checks if the current assignments differ from the ideal balanced distribution.
-func NeedsRebalance(current []ConsumerAssignment, liveWorkers []uuid.UUID) bool {
+func NeedsRebalance(current []ProjectionAssignment, liveInstances []uuid.UUID) bool {
 	if len(current) == 0 {
 		return false
 	}
 
-	consumerNames := make([]string, 0, len(current))
+	projectionNames := make([]string, 0, len(current))
 	for _, assignment := range current {
-		consumerNames = append(consumerNames, assignment.ConsumerName)
+		projectionNames = append(projectionNames, assignment.ProjectionName)
 	}
 
-	ideal := ComputeAssignments(consumerNames, liveWorkers)
+	ideal := ComputeAssignments(projectionNames, liveInstances)
 
 	for _, assignment := range current {
-		idealWorkerID, shouldBeAssigned := ideal[assignment.ConsumerName]
+		idealInstanceID, shouldBeAssigned := ideal[assignment.ProjectionName]
 		if assignment.Assigned != shouldBeAssigned {
 			return true
 		}
-		if assignment.Assigned && assignment.WorkerID != idealWorkerID {
+		if assignment.Assigned && assignment.InstanceID != idealInstanceID {
 			return true
 		}
 	}

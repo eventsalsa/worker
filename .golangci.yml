@@ -57,7 +57,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/eventsalsa/worker
+        - github.com/eventsalsa/projector
   exclusions:
     generated: lax
     paths:

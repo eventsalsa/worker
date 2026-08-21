@@ -1,11 +1,11 @@
-package worker
+package projector
 
 import (
-	"github.com/eventsalsa/store/consumer"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 var (
 	_ = uuid.Nil
-	_ consumer.Consumer
+	_ = pgx.Tx(nil)
 )

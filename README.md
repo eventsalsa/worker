@@ -1,34 +1,35 @@
-# eventsalsa/worker
+# eventsalsa/projector
 
-[![CI](https://github.com/eventsalsa/worker/actions/workflows/ci.yml/badge.svg)](https://github.com/eventsalsa/worker/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/eventsalsa/worker.svg)](https://pkg.go.dev/github.com/eventsalsa/worker)
+[![CI](https://github.com/eventsalsa/projector/actions/workflows/ci.yml/badge.svg)](https://github.com/eventsalsa/projector/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/eventsalsa/projector.svg)](https://pkg.go.dev/github.com/eventsalsa/projector)
 
-`github.com/eventsalsa/worker` is a horizontally scalable, PostgreSQL-native consumer processing module for event-sourced systems.
+`github.com/eventsalsa/projector` is a horizontally scalable, PostgreSQL-native projection processing module for event-sourced systems.
 
-It builds on [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store) and adds worker coordination, leader election, consumer assignment, checkpointing, wakeup dispatching, and batched transactional event processing with no external coordination service.
+It builds on [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store) and adds daemon coordination, leader election, projection assignment, checkpointing, wakeup dispatching, and batched transactional event processing with no external coordination service.
 
 ## Features
 
-- **Worker orchestrator** for starting, coordinating, and stopping consumer goroutines
+- **Daemon orchestrator** for starting, coordinating, and stopping projection goroutines
 - **Pluggable leader election**: choose between PostgreSQL session-level advisory locks (`pg_try_advisory_lock`) or a PgBouncer-safe table lease heartbeat strategy
-- **Horizontal scaling** through round-robin consumer assignment across active workers
+- **Horizontal scaling** through round-robin projection assignment across active projector instances
 - **Gap-aware checkpointing**: probe the frontier, handle only safe rows, and audit stale-gap advances
 - **Adaptive polling** with exponential backoff and low-latency wakeups
 - **Wakeup dispatchers**:
   - polling via periodic latest-position checks
   - PostgreSQL `LISTEN`/`NOTIFY` with reconciliation polling fallback
-- **Migration generation** for worker infrastructure tables
+- **Stream and event filtering decorators** (`FilterStreamTypes`, `FilterEventTypes`)
+- **Migration generation** for projector infrastructure tables
 - **Customizable configuration** via the functional options pattern
 
 ## How it works
 
-At runtime, each worker instance:
+At runtime, each projector daemon instance:
 
-1. Performs a best-effort cleanup of very stale worker registrations, then registers itself in PostgreSQL and updates its heartbeat periodically.
+1. Performs a best-effort cleanup of very stale instance registrations, then registers itself in PostgreSQL and updates its heartbeat periodically.
 2. Starts a dispatcher that detects newly appended events.
 3. Participates in leader election (using advisory locks or database-backed leases).
-4. Lets the elected leader rebalance consumer assignments across live workers.
-5. Runs consumer goroutines only for the consumers assigned to that worker.
+4. Lets the elected leader rebalance projection assignments across live projector instances.
+5. Runs projection goroutines only for the projections assigned to that instance.
 6. Probes the global frontier outside the batch transaction, then processes only the current safe frontier inside the batch transaction.
 
 This design keeps coordination inside PostgreSQL, making the module straightforward to operate in environments that already depend on Postgres.
@@ -37,29 +38,31 @@ This design keeps coordination inside PostgreSQL, making the module straightforw
 
 The module intentionally favors simple, database-native coordination:
 
-- **Single leader, many workers**: only the elected leader recalculates assignments; every worker still heartbeats and processes its own assigned consumers.
-- **Advisory-lock leadership**: leader election uses PostgreSQL session-level advisory locks instead of Redis, ZooKeeper, or etcd.
-- **Conservative worker-node cleanup**: startup may prune `worker_nodes` rows only when they are much older than the live-worker timeout, so housekeeping stays less aggressive than rebalance liveness checks.
-- **Scoped handling after frontier probe**: consumers that implement `consumer.ScopedConsumer` still receive only matching events, but checkpoint correctness comes from an unscoped frontier probe rather than from the last matching scoped row.
-- **Broadcast wakeups via close-and-replace channels**: dispatchers notify all waiting consumer loops by closing the current wakeup channel and replacing it with a new one.
-- **Adaptive polling**: consumer loops start at a base poll interval, back off exponentially when idle, stay hot while blocked on known gaps, and reset immediately when new events are found or a wakeup arrives.
+- **Single leader, many instances**: only the elected leader recalculates assignments; every projector instance still heartbeats and processes its own assigned projections.
+- **Advisory-lock or lease-based leadership**: choose between zero-overhead session advisory locks or PgBouncer transaction pooling-safe database leases.
+- **Conservative instance cleanup**: startup may prune `projector_instances` rows only when they are much older than the live-instance timeout, so housekeeping stays less aggressive than rebalance liveness checks.
+- **Scoped handling after frontier probe**: projections decorated with `FilterStreamTypes` or `FilterEventTypes` receive only matching events, but checkpoint correctness comes from an unscoped frontier probe rather than from the last matching filtered row.
+- **Broadcast wakeups via close-and-replace channels**: dispatchers notify all waiting projection loops by closing the current wakeup channel and replacing it with a new one.
+- **Adaptive polling**: projection loops start at a base poll interval, back off exponentially when idle, stay hot while blocked on known gaps, and reset immediately when new events are found or a wakeup arrives.
 
 ## Package layout
 
 ```text
 .
-├── cmd/migrate-gen/         # Stable CLI for generating worker infrastructure migrations
-├── worker.go / config.go   # Worker orchestrator and configuration
-├── dispatcher/             # PollDispatcher and NotifyDispatcher
-├── postgres/               # PostgreSQL DAL for registration, leadership, assignment, checkpoints, gap-skip audit
-├── migrations/             # SQL migration generator for worker metadata tables
-└── integration_test/       # Integration tests against real PostgreSQL
+├── cmd/migrate-gen/         # Stable CLI for generating projector infrastructure migrations
+├── daemon.go / config.go    # Projector Daemon and configuration
+├── projection.go            # Projection interface and filter decorators
+├── frontier.go              # Safe frontier and safe harbor calculation
+├── dispatcher/              # PollDispatcher and NotifyDispatcher
+├── postgres/                # PostgreSQL DAL for registration, leadership, assignment, checkpoints, gap-skip audit
+├── migrations/              # SQL migration generator for projector metadata tables
+└── integration_test/        # Integration tests against real PostgreSQL
 ```
 
 ## Installation
 
 ```bash
-go get github.com/eventsalsa/worker
+go get github.com/eventsalsa/projector
 ```
 
 The module is intended to be used alongside `github.com/eventsalsa/store` and its PostgreSQL implementation.
@@ -79,27 +82,27 @@ The module is intended to be used alongside `github.com/eventsalsa/store` and it
 You need:
 
 - the event store tables from `github.com/eventsalsa/store`
-- the worker metadata tables generated from `github.com/eventsalsa/worker/cmd/migrate-gen`
+- the projector metadata tables generated from `github.com/eventsalsa/projector/cmd/migrate-gen`
 
-### 2. Build an event store
+### 2. Build and run the projector daemon
 
 ```go
 package main
 
 import (
     "context"
-    "database/sql"
     "log"
     "os"
     "os/signal"
     "syscall"
     "time"
 
-    _ "github.com/lib/pq"
+    "github.com/jackc/pgx/v5"
+    "github.com/jackc/pgx/v5/pgxpool"
+
+    "github.com/eventsalsa/projector"
     "github.com/eventsalsa/store"
     storepostgres "github.com/eventsalsa/store/postgres"
-    "github.com/eventsalsa/store/consumer"
-    "github.com/eventsalsa/worker"
 )
 
 type AccountProjection struct{}
@@ -108,11 +111,7 @@ func (p *AccountProjection) Name() string {
     return "account_projection"
 }
 
-func (p *AccountProjection) StreamTypes() []string {
-    return []string{"Account"}
-}
-
-func (p *AccountProjection) Handle(ctx context.Context, tx *sql.Tx, event store.PersistedEvent) error {
+func (p *AccountProjection) Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error {
     _ = ctx
     _ = tx
     _ = event
@@ -120,9 +119,11 @@ func (p *AccountProjection) Handle(ctx context.Context, tx *sql.Tx, event store.
 }
 
 func main() {
-    connStr := os.Getenv("DATABASE_URL")
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
 
-    db, err := sql.Open("postgres", connStr)
+    connStr := os.Getenv("DATABASE_URL")
+    db, err := pgxpool.New(ctx, connStr)
     if err != nil {
         log.Fatal(err)
     }
@@ -130,48 +131,46 @@ func main() {
 
     eventStore := storepostgres.NewStore(storepostgres.DefaultStoreConfig())
 
-    consumers := []consumer.Consumer{
-        &AccountProjection{},
+    projections := []projector.Projection{
+        projector.FilterStreamTypes(&AccountProjection{}, "Account"),
     }
 
-    w := worker.New(
+    daemon := projector.New(
         db,
         eventStore,
-        consumers,
-        worker.WithBatchSize(100),
-        worker.WithPollInterval(500*time.Millisecond),
+        projections,
+        projector.WithBatchSize(100),
+        projector.WithPollInterval(500*time.Millisecond),
     )
 
-    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
-
-    if err := w.Start(ctx); err != nil {
+    if err := daemon.Start(ctx); err != nil {
         log.Fatal(err)
     }
 }
 ```
 
 > [!NOTE]
-> `(*worker.Worker).Start` blocks until the context is canceled or a fatal runtime error occurs.
+> `(*projector.Daemon).Start` blocks until the context is canceled or a fatal runtime error occurs.
 
 ## Configuration
 
-Workers are configured with functional options:
+Daemons are configured with functional options:
 
 ```go
-w := worker.New(db, eventStore, consumers,
-    worker.WithBatchSize(100),
-    worker.WithPollInterval(500*time.Millisecond),
-    worker.WithMaxPollInterval(5*time.Second),
-    worker.WithDispatcherInterval(200*time.Millisecond),
-    worker.WithHeartbeatInterval(5*time.Second),
-    worker.WithHeartbeatTimeout(30*time.Second),
-    worker.WithRebalanceInterval(5*time.Second),
-    worker.WithBatchPause(200*time.Millisecond),
-    worker.WithDispatcherStrategy(worker.DispatcherStrategyNotify),
-    worker.WithNotifyConnectionString(connStr),
-    worker.WithNotifyChannel("worker_events"),
-    worker.WithLogger(myLogger),
+daemon := projector.New(db, eventStore, projections,
+    projector.WithBatchSize(100),
+    projector.WithPollInterval(500*time.Millisecond),
+    projector.WithMaxPollInterval(5*time.Second),
+    projector.WithDispatcherInterval(200*time.Millisecond),
+    projector.WithHeartbeatInterval(5*time.Second),
+    projector.WithHeartbeatTimeout(30*time.Second),
+    projector.WithRebalanceInterval(5*time.Second),
+    projector.WithBatchPause(200*time.Millisecond),
+    projector.WithDispatcherStrategy(projector.DispatcherStrategyNotify),
+    projector.WithNotifyConnectionString(connStr),
+    projector.WithNotifyChannel("projector_events"),
+    projector.WithLeaderStrategy(projector.LeaderStrategyLease),
+    projector.WithLogger(myLogger),
 )
 ```
 
@@ -180,41 +179,41 @@ w := worker.New(db, eventStore, consumers,
 | Option | Description | Default |
 | --- | --- | --- |
 | `WithBatchSize(n int)` | Maximum size of the probed/handled batch window | `100` |
-| `WithPollInterval(d time.Duration)` | Base consumer poll interval | `1s` |
+| `WithPollInterval(d time.Duration)` | Base projection poll interval | `1s` |
 | `WithMaxPollInterval(d time.Duration)` | Maximum adaptive poll backoff | `30s` |
 | `WithDispatcherInterval(d time.Duration)` | Poll dispatcher interval | `200ms` |
-| `WithHeartbeatInterval(d time.Duration)` | Worker heartbeat interval | `5s` |
+| `WithHeartbeatInterval(d time.Duration)` | Instance heartbeat interval | `5s` |
 | `WithHeartbeatTimeout(d time.Duration)` | Heartbeat staleness timeout | `30s` |
 | `WithRebalanceInterval(d time.Duration)` | Leader rebalance check interval | `5s` |
 | `WithBatchPause(d time.Duration)` | Pause between consecutive full batches during catch-up | `200ms` |
 | `WithLogger(l store.Logger)` | Custom logger implementation | `store.NoOpLogger{}` |
-| `WithWorkerNodesTable(name string)` | Override worker registration table name | `worker_nodes` |
-| `WithConsumerAssignmentsTable(name string)` | Override assignment table name | `consumer_assignments` |
-| `WithConsumerCheckpointsTable(name string)` | Override checkpoint table name | `consumer_checkpoints` |
-| `WithConsumerGapSkipsTable(name string)` | Override stale-gap audit table name | `consumer_gap_skips` |
-| `WithStaleGapThreshold(d time.Duration)` | How long the worker waits on the same missing position before safe-harbor advancement | `30s` |
-| `WithStaleGapHarborLag(n int)` | How far behind the visible head the worker tries to stay when advancing past a stale gap; capped at `BatchSize-1` and further clamped to the reachable visible window during fallback | `8` |
-| `WithDispatcherStrategy(strategy)` | Wakeup strategy: `worker.DispatcherStrategyPoll` or `worker.DispatcherStrategyNotify` | `worker.DispatcherStrategyPoll` |
+| `WithProjectorInstancesTable(name string)` | Override instance registration table name | `projector_instances` |
+| `WithProjectionAssignmentsTable(name string)` | Override assignment table name | `projection_assignments` |
+| `WithProjectionCheckpointsTable(name string)` | Override checkpoint table name | `projection_checkpoints` |
+| `WithProjectionGapSkipsTable(name string)` | Override stale-gap audit table name | `projection_gap_skips` |
+| `WithProjectorLeaderLeasesTable(name string)` | Override leader election lease table name | `projector_leader_leases` |
+| `WithStaleGapThreshold(d time.Duration)` | How long the daemon waits on the same missing position before safe-harbor advancement | `30s` |
+| `WithStaleGapHarborLag(n int)` | How far behind the visible head the daemon stays when advancing past a stale gap | `8` |
+| `WithDispatcherStrategy(strategy)` | Wakeup strategy: `projector.DispatcherStrategyPoll` or `projector.DispatcherStrategyNotify` | `projector.DispatcherStrategyPoll` |
 | `WithNotifyConnectionString(connStr string)` | PostgreSQL connection string used by the notify dispatcher | empty |
-| `WithNotifyChannel(channel string)` | PostgreSQL notification channel for the notify dispatcher | `worker_events` |
-| `WithLeaderStrategy(strategy)` | Leader election strategy: `worker.LeaderStrategyAdvisory` or `worker.LeaderStrategyLease` | `worker.LeaderStrategyAdvisory` |
-| `WithLeaderElectionTable(name string)` | Override leader election lease table name | `worker_leader_election` |
+| `WithNotifyChannel(channel string)` | PostgreSQL notification channel for the notify dispatcher | empty (`""`) |
+| `WithLeaderStrategy(strategy)` | Leader election strategy: `projector.LeaderStrategyAdvisory` or `projector.LeaderStrategyLease` | `projector.LeaderStrategyAdvisory` |
 
 ### Leader election strategies
 
 #### Advisory lock strategy (Default)
 
-`worker.LeaderStrategyAdvisory` uses PostgreSQL session-level advisory locks. This strategy is extremely lightweight and releases immediately when a node goes down, but it requires a dedicated, persistent connection and is **incompatible** with connection poolers like PgBouncer in transaction pooling mode.
+`projector.LeaderStrategyAdvisory` uses PostgreSQL session-level advisory locks. This strategy is extremely lightweight and releases immediately when a node goes down, but it requires a dedicated connection and is **incompatible** with connection poolers like PgBouncer in transaction pooling mode.
 
 #### Lease-based strategy (PgBouncer-safe)
 
-`worker.LeaderStrategyLease` coordinates leadership through a central lease table (`worker_leader_election`) using short-lived transactions. The leader periodically heartbeats/renews its lease record. If a leader crashes, other nodes can take over leadership after the lease duration (`HeartbeatTimeout`) has expired. This strategy is fully safe for deployments running behind PgBouncer in transaction pooling mode.
+`projector.LeaderStrategyLease` coordinates leadership through a central lease table (`projector_leader_leases`) using short-lived transactions. The leader periodically heartbeats/renews its lease record. If a leader crashes, other nodes can take over leadership after the lease duration (`HeartbeatTimeout`) has expired. This strategy is fully safe for deployments running behind PgBouncer in transaction pooling mode.
 
 ### Dispatcher strategies
 
 #### Poll dispatcher
 
-`worker.DispatcherStrategyPoll` periodically checks the latest global event position and wakes consumers when it advances.
+`projector.DispatcherStrategyPoll` periodically checks the latest global event position and wakes projections when it advances.
 
 Use it when:
 
@@ -224,76 +223,81 @@ Use it when:
 
 #### Notify dispatcher
 
-`worker.DispatcherStrategyNotify` listens for PostgreSQL notifications and also performs reconciliation polling as a safety net.
+`projector.DispatcherStrategyNotify` listens for PostgreSQL notifications and also performs reconciliation polling as a safety net.
 
 Use it when:
 
-- you want lower event-to-consumer latency
+- you want lower event-to-projection latency
 - your store append path emits PostgreSQL notifications
 - you can provide a dedicated notification connection string
 
 When you use notify mode, configure both sides to use the same channel:
 
 - the **store** appends events and emits `NOTIFY`
-- the **worker** listens on that channel and wakes assigned consumers
+- the **projector** listens on that channel and wakes assigned projections
 
 Example:
 
 ```go
 storeConfig := storepostgres.NewStoreConfig(
-    storepostgres.WithNotifyChannel("worker_events"),
+    storepostgres.WithNotifyChannel("projector_events"),
 )
 
 eventStore := storepostgres.NewStore(storeConfig)
 
-w := worker.New(
+daemon := projector.New(
     db,
     eventStore,
-    consumers,
-    worker.WithDispatcherStrategy(worker.DispatcherStrategyNotify),
-    worker.WithNotifyConnectionString(connStr),
-    worker.WithNotifyChannel("worker_events"),
+    projections,
+    projector.WithDispatcherStrategy(projector.DispatcherStrategyNotify),
+    projector.WithNotifyConnectionString(connStr),
+    projector.WithNotifyChannel("projector_events"),
 )
 ```
 
-## Consumer contract
-
-The worker consumes handlers from `github.com/eventsalsa/store/consumer`.
+## Projection contract
 
 ```go
-type Consumer interface {
+type Projection interface {
     Name() string
-    Handle(ctx context.Context, tx *sql.Tx, event store.PersistedEvent) error
-}
-
-type ScopedConsumer interface {
-    Consumer
-    StreamTypes() []string
+    Handle(ctx context.Context, tx pgx.Tx, event store.PersistedEvent) error
 }
 ```
 
-### Important consumer semantics
+### Decorators
 
-- Consumer names must be unique across the worker process.
-- A consumer with an empty name is invalid.
+Filter decorators allow filtering events before they reach your handler without complicating the handler itself:
+
+```go
+// Filter by stream type
+p := projector.FilterStreamTypes(myProjection, "Account", "Order")
+
+// Filter by event type
+p := projector.FilterEventTypes(myProjection, "AccountCreated", "AccountClosed")
+```
+
+### Important projection semantics
+
+- Projection names must be unique across the projector daemon.
+- A projection with an empty name is invalid.
 - `Handle` receives a transaction that also owns checkpoint persistence.
-- Consumers must **not** call `Commit` or `Rollback` on the provided transaction.
+- Projections must **not** call `Commit` or `Rollback` on the provided transaction.
 - If `Handle` returns an error, the batch fails and the checkpoint is not advanced.
-- `ScopedConsumer` is optional; consumers that do not implement it receive all events.
+- Filtered events are safely skipped and checkpoints advance normally.
 
 ### Checkpoint semantics
 
-Consumer checkpoints track the **highest safe global position** the worker has advanced to, not the last matching scoped event handled by that consumer.
+Projection checkpoints track the **highest safe global position** the daemon has advanced to, not the last matching filtered event handled by that projection.
 
 That means:
 
-- scoped consumers can handle zero events in a batch while the checkpoint still advances
+- filtered projections can handle zero events in a batch while the checkpoint still advances
 - later matching events never define the checkpoint target by themselves
-- stale-gap advances are durably recorded in `consumer_gap_skips`
+- stale-gap advances are durably recorded in `projection_gap_skips`
 
 ## Processing model
 
-For each assigned consumer, the worker repeatedly:
+For each assigned projection, the daemon repeatedly:
 
 1. loads the current checkpoint
 2. performs an **unscoped frontier probe** outside the batch transaction
@@ -307,37 +311,38 @@ That means read-model updates performed through `tx`, checkpoint moves, and stal
 
 ### Stale-gap behavior
 
-`global_position` values are sequence-backed, so a lower position can appear later than a higher committed position. The worker therefore:
+`global_position` values are sequence-backed, so a lower position can appear later than a higher committed position. The daemon therefore:
 
 - refuses to checkpoint past a visible gap immediately
 - keeps polling the same gap for up to `StaleGapThreshold`
 - if the gap stays unresolved, advances conservatively to a safe harbor behind the current visible head, falling back to the earliest reachable visible frontier when the probe window is smaller than the configured lag
-- records that decision in `consumer_gap_skips` so operators can inspect it later
+- records that decision in `projection_gap_skips` so operators can inspect it later
 
-If a stale-gap decision later proves too aggressive for a consumer, the recovery path is to rewind or rebuild from a safe checkpoint.
+If a stale-gap decision later proves too aggressive for a projection, the recovery path is to rewind or rebuild from a safe checkpoint.
 
 ## Migration generation
 
 For the quickest path, use the stable `cmd/migrate-gen` entrypoint.
 
 ```bash
-go run github.com/eventsalsa/worker/cmd/migrate-gen \
+go run github.com/eventsalsa/projector/cmd/migrate-gen \
   -output ./db/migrations \
-  -filename 002_worker_tables.sql
+  -filename 002_projector_tables.sql
 ```
 
-The CLI defaults match `migrations.DefaultConfig()`, and you can override table names to line up with `worker.With*Table(...)` options:
+The CLI defaults match `migrations.DefaultConfig()`, and you can override table names to line up with `projector.With*Table(...)` options:
 
 ```bash
-go run github.com/eventsalsa/worker/cmd/migrate-gen \
+go run github.com/eventsalsa/projector/cmd/migrate-gen \
   -output ./db/migrations \
-  -worker-nodes-table infra.worker_nodes \
-  -consumer-assignments-table infra.consumer_assignments \
-  -consumer-checkpoints-table infra.consumer_checkpoints \
-  -consumer-gap-skips-table infra.consumer_gap_skips
+  -projector-instances-table infra.projector_instances \
+  -projection-assignments-table infra.projection_assignments \
+  -projection-checkpoints-table infra.projection_checkpoints \
+  -projection-gap-skips-table infra.projection_gap_skips \
+  -projector-leader-leases-table infra.projector_leader_leases
 ```
 
-For more advanced integration, use the `migrations` package directly from your own program.
+For more advanced integration, use the `migrations` package directly from your own program:
 
 ```go
 package main
@@ -345,56 +350,58 @@ package main
 import (
     "log"
 
-    "github.com/eventsalsa/worker/migrations"
+    "github.com/eventsalsa/projector/migrations"
 )
 
 func main() {
-	config := migrations.DefaultConfig()
-	config.OutputFolder = "./db/migrations"
-	config.OutputFilename = "002_worker_tables.sql"
-	config.WorkerNodesTable = "infra.worker_nodes"
-	config.ConsumerAssignmentsTable = "infra.consumer_assignments"
-	config.ConsumerCheckpointsTable = "infra.consumer_checkpoints"
-	config.ConsumerGapSkipsTable = "infra.consumer_gap_skips"
+    config := migrations.DefaultConfig()
+    config.OutputFolder = "./db/migrations"
+    config.OutputFilename = "002_projector_tables.sql"
+    config.ProjectorInstancesTable = "infra.projector_instances"
+    config.ProjectionAssignmentsTable = "infra.projection_assignments"
+    config.ProjectionCheckpointsTable = "infra.projection_checkpoints"
+    config.ProjectionGapSkipsTable = "infra.projection_gap_skips"
+    config.ProjectorLeaderLeasesTable = "infra.projector_leader_leases"
 
-	if err := migrations.GeneratePostgres(&config); err != nil {
-		log.Fatal(err)
-	}
+    if err := migrations.GeneratePostgres(&config); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
 The generated migration creates:
 
-- `worker_nodes`
-- `consumer_assignments`
-- `consumer_checkpoints`
-- `consumer_gap_skips`
+- `projector_instances`
+- `projection_assignments`
+- `projection_checkpoints`
+- `projection_gap_skips`
+- `projector_leader_leases`
 
 It also creates schemas automatically when a configured table name includes a schema prefix.
 
-## Running multiple workers
+## Running multiple projector instances
 
-To scale horizontally, start multiple instances of the same worker configuration against the same PostgreSQL database.
+To scale horizontally, start multiple instances of the same projector daemon configuration against the same PostgreSQL database.
 
 Each instance will:
 
-- register itself with a unique worker ID
-- heartbeat into `worker_nodes`
+- register itself with a unique instance ID
+- heartbeat into `projector_instances`
 - observe leader election
-- receive a subset of consumer assignments
-- stop processing consumers that are reassigned elsewhere
+- receive a subset of projection assignments
+- stop processing projections that are reassigned elsewhere
 
-This makes scaling operationally simple: add more worker processes and let PostgreSQL-backed assignment rebalancing distribute the consumers.
+This makes scaling operationally simple: add more projector daemon processes and let PostgreSQL-backed assignment rebalancing distribute the projections.
 
-On startup, a worker may also prune `worker_nodes` rows whose heartbeats are older than twice the configured heartbeat timeout. That cleanup is best-effort and intentionally more conservative than rebalance liveness detection. If a worker ever loses its own registration row later, it shuts down instead of continuing to run invisibly.
+On startup, an instance may also prune `projector_instances` rows whose heartbeats are older than twice the configured heartbeat timeout. That cleanup is best-effort and intentionally more conservative than rebalance liveness detection. If an instance ever loses its own registration row later, it shuts down instead of continuing to run invisibly.
 
 ## Development
 
 ### Clone and set up
 
 ```bash
-git clone https://github.com/eventsalsa/worker.git
-cd worker
+git clone https://github.com/eventsalsa/projector.git
+cd projector
 go mod download
 ```
 
@@ -433,12 +440,12 @@ POSTGRES_HOST=localhost \
 POSTGRES_PORT=5432 \
 POSTGRES_USER=postgres \
 POSTGRES_PASSWORD=postgres \
-POSTGRES_DB=eventsalsa_worker_test \
+POSTGRES_DB=eventsalsa_projector_test \
 make test-integration
 ```
 
 ## Notes
 
-- The worker module coordinates consumers; it does not replace the event store.
-- The worker depends on PostgreSQL for both persistence and coordination.
+- The projector module coordinates projections; it does not replace the event store.
+- The projector depends on PostgreSQL for both persistence and coordination.
 - For most applications, start with the poll dispatcher and move to notify mode when lower wakeup latency is needed.

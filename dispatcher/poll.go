@@ -87,7 +87,7 @@ func (d *PollDispatcher) Start(ctx context.Context) error {
 	}
 }
 
-// WakeupChan returns the wakeup channel shared with consumer goroutines.
+// WakeupChan returns the wakeup channel shared with projection goroutines.
 func (d *PollDispatcher) WakeupChan() <-chan struct{} {
 	return d.wakeup.Channel()
 }

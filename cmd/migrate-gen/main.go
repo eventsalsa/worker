@@ -1,12 +1,12 @@
-// Command migrate-gen generates SQL migration files for worker infrastructure.
+// Command migrate-gen generates SQL migration files for projector infrastructure.
 //
 // Usage:
 //
-//	go run github.com/eventsalsa/worker/cmd/migrate-gen -output migrations -filename init_worker.sql
+//	go run github.com/eventsalsa/projector/cmd/migrate-gen -output migrations -filename init_projector.sql
 //
 // Or with go generate:
 //
-//	//go:generate go run github.com/eventsalsa/worker/cmd/migrate-gen -output migrations
+//	//go:generate go run github.com/eventsalsa/projector/cmd/migrate-gen -output migrations
 package main
 
 import (
@@ -17,7 +17,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/eventsalsa/worker/migrations"
+	"github.com/eventsalsa/projector/migrations"
 )
 
 func main() {
@@ -32,11 +32,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	outputFolder := flags.String("output", config.OutputFolder, "Output folder for migration file")
 	outputFilename := flags.String("filename", "", "Output filename (default: timestamp-based)")
-	workerNodesTable := flags.String("worker-nodes-table", config.WorkerNodesTable, "Name of worker nodes table")
-	consumerAssignmentsTable := flags.String("consumer-assignments-table", config.ConsumerAssignmentsTable, "Name of consumer assignments table")
-	consumerCheckpointsTable := flags.String("consumer-checkpoints-table", config.ConsumerCheckpointsTable, "Name of consumer checkpoints table")
-	consumerGapSkipsTable := flags.String("consumer-gap-skips-table", config.ConsumerGapSkipsTable, "Name of consumer gap skips table")
-	leaderElectionTable := flags.String("leader-election-table", config.LeaderElectionTable, "Name of leader election table")
+	projectorInstancesTable := flags.String("projector-instances-table", config.ProjectorInstancesTable, "Name of projector instances table")
+	projectionAssignmentsTable := flags.String("projection-assignments-table", config.ProjectionAssignmentsTable, "Name of projection assignments table")
+	projectionCheckpointsTable := flags.String("projection-checkpoints-table", config.ProjectionCheckpointsTable, "Name of projection checkpoints table")
+	projectionGapSkipsTable := flags.String("projection-gap-skips-table", config.ProjectionGapSkipsTable, "Name of projection gap skips table")
+	projectorLeaderLeasesTable := flags.String("projector-leader-leases-table", config.ProjectorLeaderLeasesTable, "Name of leader lease table")
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -47,11 +47,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	config.OutputFolder = *outputFolder
-	config.WorkerNodesTable = *workerNodesTable
-	config.ConsumerAssignmentsTable = *consumerAssignmentsTable
-	config.ConsumerCheckpointsTable = *consumerCheckpointsTable
-	config.ConsumerGapSkipsTable = *consumerGapSkipsTable
-	config.LeaderElectionTable = *leaderElectionTable
+	config.ProjectorInstancesTable = *projectorInstancesTable
+	config.ProjectionAssignmentsTable = *projectionAssignmentsTable
+	config.ProjectionCheckpointsTable = *projectionCheckpointsTable
+	config.ProjectionGapSkipsTable = *projectionGapSkipsTable
+	config.ProjectorLeaderLeasesTable = *projectorLeaderLeasesTable
 
 	if *outputFilename != "" {
 		config.OutputFilename = *outputFilename
