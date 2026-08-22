@@ -40,6 +40,9 @@ func TestDefaultConfig(t *testing.T) {
 	if config.BatchTimeout != 30*time.Second {
 		t.Fatalf("BatchTimeout = %v, want %v", config.BatchTimeout, 30*time.Second)
 	}
+	if config.ShutdownTimeout != 5*time.Second {
+		t.Fatalf("ShutdownTimeout = %v, want %v", config.ShutdownTimeout, 5*time.Second)
+	}
 	if config.StaleGapThreshold != 30*time.Second {
 		t.Fatalf("StaleGapThreshold = %v, want %v", config.StaleGapThreshold, 30*time.Second)
 	}
@@ -87,6 +90,8 @@ func TestApplyOptionsComposesMultipleOptions(t *testing.T) {
 		WithHeartbeatTimeout(45*time.Second),
 		WithRebalanceInterval(7*time.Second),
 		WithBatchPause(300*time.Millisecond),
+		WithBatchTimeout(15*time.Second),
+		WithShutdownTimeout(12*time.Second),
 		WithStaleGapThreshold(45*time.Second),
 		WithStaleGapHarborLag(5),
 		WithProjectorInstancesTable("custom_instances"),
@@ -121,6 +126,12 @@ func TestApplyOptionsComposesMultipleOptions(t *testing.T) {
 	}
 	if config.BatchPause != 300*time.Millisecond {
 		t.Fatalf("BatchPause = %v, want %v", config.BatchPause, 300*time.Millisecond)
+	}
+	if config.BatchTimeout != 15*time.Second {
+		t.Fatalf("BatchTimeout = %v, want %v", config.BatchTimeout, 15*time.Second)
+	}
+	if config.ShutdownTimeout != 12*time.Second {
+		t.Fatalf("ShutdownTimeout = %v, want %v", config.ShutdownTimeout, 12*time.Second)
 	}
 	if config.StaleGapThreshold != 45*time.Second {
 		t.Fatalf("StaleGapThreshold = %v, want %v", config.StaleGapThreshold, 45*time.Second)
@@ -164,6 +175,8 @@ func TestOptionFunctions(t *testing.T) {
 	WithHeartbeatTimeout(45 * time.Second)(&config)
 	WithRebalanceInterval(7 * time.Second)(&config)
 	WithBatchPause(300 * time.Millisecond)(&config)
+	WithBatchTimeout(20 * time.Second)(&config)
+	WithShutdownTimeout(8 * time.Second)(&config)
 	WithStaleGapThreshold(45 * time.Second)(&config)
 	WithStaleGapHarborLag(5)(&config)
 	WithProjectorInstancesTable("custom_instances")(&config)
@@ -197,6 +210,12 @@ func TestOptionFunctions(t *testing.T) {
 	}
 	if config.BatchPause != 300*time.Millisecond {
 		t.Fatalf("BatchPause = %v, want %v", config.BatchPause, 300*time.Millisecond)
+	}
+	if config.BatchTimeout != 20*time.Second {
+		t.Fatalf("BatchTimeout = %v, want %v", config.BatchTimeout, 20*time.Second)
+	}
+	if config.ShutdownTimeout != 8*time.Second {
+		t.Fatalf("ShutdownTimeout = %v, want %v", config.ShutdownTimeout, 8*time.Second)
 	}
 	if config.StaleGapThreshold != 45*time.Second {
 		t.Fatalf("StaleGapThreshold = %v, want %v", config.StaleGapThreshold, 45*time.Second)
@@ -254,6 +273,8 @@ func TestApplyOptionsNormalizesInvalidValues(t *testing.T) {
 		WithHeartbeatTimeout(0),
 		WithRebalanceInterval(0),
 		WithBatchPause(-time.Second),
+		WithBatchTimeout(0),
+		WithShutdownTimeout(0),
 		WithStaleGapThreshold(0),
 		WithStaleGapHarborLag(-1),
 		WithProjectorInstancesTable(""),
@@ -294,8 +315,11 @@ func TestApplyOptionsNormalizesInvalidValues(t *testing.T) {
 	if config.BatchPause != defaults.BatchPause {
 		t.Fatalf("BatchPause = %v, want default %v", config.BatchPause, defaults.BatchPause)
 	}
-	if config.StaleGapThreshold != defaults.StaleGapThreshold {
-		t.Fatalf("StaleGapThreshold = %v, want default %v", config.StaleGapThreshold, defaults.StaleGapThreshold)
+	if config.BatchTimeout != defaults.BatchTimeout {
+		t.Fatalf("BatchTimeout = %v, want default %v", config.BatchTimeout, defaults.BatchTimeout)
+	}
+	if config.ShutdownTimeout != defaults.ShutdownTimeout {
+		t.Fatalf("ShutdownTimeout = %v, want default %v", config.ShutdownTimeout, defaults.ShutdownTimeout)
 	}
 	if config.StaleGapHarborLag != defaults.StaleGapHarborLag {
 		t.Fatalf("StaleGapHarborLag = %d, want default %d", config.StaleGapHarborLag, defaults.StaleGapHarborLag)

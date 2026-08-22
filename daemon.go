@@ -153,6 +153,9 @@ func (d *Daemon) Start(parent context.Context) (err error) {
 	}()
 
 	if err := d.initialize(controlCtx, &registered); err != nil {
+		if controlCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, controlCtx.Err())) {
+			return nil
+		}
 		return err
 	}
 
@@ -218,7 +221,8 @@ func (d *Daemon) shutdown(registered *bool) {
 	logger := d.logger()
 	d.stopAllProjections()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+	timeout := d.shutdownTimeout()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
 	defer shutdownCancel()
 
 	if *registered {
@@ -237,7 +241,7 @@ func (d *Daemon) shutdown(registered *bool) {
 
 	select {
 	case <-done:
-	case <-time.After(defaultShutdownTimeout):
+	case <-time.After(timeout):
 		if processingCancel := d.getProcessingCancel(); processingCancel != nil {
 			logger.Error(shutdownCtx, "daemon shutdown timed out; canceling active batches", "instance_id", d.id)
 			processingCancel()
@@ -245,7 +249,7 @@ func (d *Daemon) shutdown(registered *bool) {
 
 		select {
 		case <-done:
-		case <-time.After(defaultShutdownTimeout):
+		case <-time.After(timeout):
 			logger.Error(shutdownCtx, "daemon shutdown did not complete after forced cancellation", "instance_id", d.id)
 		}
 	}
@@ -681,7 +685,7 @@ func (d *Daemon) syncAssignments(ctx, processingCtx context.Context) error {
 
 //nolint:gocyclo // orchestration loop with clear structure
 func (d *Daemon) runProjection(
-	controlCtx, _, assignmentCtx context.Context,
+	controlCtx, processingCtx, assignmentCtx context.Context,
 	registeredProjection Projection,
 ) {
 	logger := d.logger()
@@ -722,7 +726,7 @@ func (d *Daemon) runProjection(
 		default:
 		}
 
-		result, err := d.processBatchWithGapState(controlCtx, registeredProjection, gapTracker)
+		result, err := d.processBatchWithGapState(processingCtx, registeredProjection, gapTracker)
 		if controlCtx.Err() != nil || assignmentCtx.Err() != nil {
 			return
 		}
@@ -1352,6 +1356,19 @@ func (d *Daemon) dropLeaderConnection(ctx context.Context) {
 	}
 }
 
+// IsRunning returns true if the daemon is currently started and running.
+func (d *Daemon) IsRunning() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.started
+}
+
+// IsLeader returns true if this instance currently holds the leader role.
+func (d *Daemon) IsLeader() bool {
+	return d.leaderActive()
+}
+
 func (d *Daemon) leaderActive() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1364,6 +1381,14 @@ func (d *Daemon) setLeader(isLeader bool) {
 	defer d.mu.Unlock()
 
 	d.isLeader = isLeader
+}
+
+func (d *Daemon) shutdownTimeout() time.Duration {
+	if d.config.ShutdownTimeout <= 0 {
+		return defaultShutdownTimeout
+	}
+
+	return d.config.ShutdownTimeout
 }
 
 func (d *Daemon) assignmentPollInterval() time.Duration {
@@ -1519,6 +1544,9 @@ func applyOptions(opts ...Option) Config { //nolint:gocyclo // sequential valida
 	}
 	if config.BatchTimeout <= 0 {
 		config.BatchTimeout = defaults.BatchTimeout
+	}
+	if config.ShutdownTimeout <= 0 {
+		config.ShutdownTimeout = defaults.ShutdownTimeout
 	}
 	if config.StaleGapThreshold <= 0 {
 		config.StaleGapThreshold = defaults.StaleGapThreshold
