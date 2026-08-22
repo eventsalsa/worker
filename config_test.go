@@ -70,6 +70,9 @@ func TestDefaultConfig(t *testing.T) {
 	if _, ok := config.Logger.(store.NoOpLogger); !ok {
 		t.Fatalf("Logger = %T, want store.NoOpLogger", config.Logger)
 	}
+	if config.Observer != nil {
+		t.Fatalf("Observer = %v, want nil", config.Observer)
+	}
 }
 
 func TestApplyOptionsComposesMultipleOptions(t *testing.T) {
@@ -92,6 +95,7 @@ func TestApplyOptionsComposesMultipleOptions(t *testing.T) {
 		WithProjectionGapSkipsTable("custom_gap_skips"),
 		WithProjectorLeaderLeasesTable("custom_leases"),
 		WithLogger(logger),
+		WithObserver(&recordingObserver{}),
 	)
 
 	if config.BatchSize != 17 {
@@ -142,10 +146,14 @@ func TestApplyOptionsComposesMultipleOptions(t *testing.T) {
 	if config.Logger != logger {
 		t.Fatalf("Logger = %v, want %v", config.Logger, logger)
 	}
+	if _, ok := config.Observer.(*recordingObserver); !ok {
+		t.Fatalf("Observer = %T, want *recordingObserver", config.Observer)
+	}
 }
 
 func TestOptionFunctions(t *testing.T) {
 	logger := store.NoOpLogger{}
+	obs := &recordingObserver{}
 	config := Config{}
 
 	WithBatchSize(17)(&config)
@@ -164,6 +172,7 @@ func TestOptionFunctions(t *testing.T) {
 	WithProjectionGapSkipsTable("custom_gap_skips")(&config)
 	WithProjectorLeaderLeasesTable("custom_leases")(&config)
 	WithLogger(logger)(&config)
+	WithObserver(obs)(&config)
 
 	if config.BatchSize != 17 {
 		t.Fatalf("BatchSize = %d, want 17", config.BatchSize)
@@ -212,6 +221,9 @@ func TestOptionFunctions(t *testing.T) {
 	}
 	if config.Logger != logger {
 		t.Fatalf("Logger = %v, want %v", config.Logger, logger)
+	}
+	if config.Observer != obs {
+		t.Fatalf("Observer = %v, want %v", config.Observer, obs)
 	}
 }
 
@@ -250,8 +262,13 @@ func TestApplyOptionsNormalizesInvalidValues(t *testing.T) {
 		WithProjectionGapSkipsTable(""),
 		WithProjectorLeaderLeasesTable(""),
 		WithLogger(nil),
+		WithObserver(nil),
 		nil,
 	)
+
+	if config.Observer != nil {
+		t.Fatalf("Observer = %v, want nil", config.Observer)
+	}
 
 	if config.BatchSize != defaults.BatchSize {
 		t.Fatalf("BatchSize = %d, want default %d", config.BatchSize, defaults.BatchSize)

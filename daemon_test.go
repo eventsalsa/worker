@@ -2019,3 +2019,448 @@ func (e *stubSQLStateError) Error() string {
 func (e *stubSQLStateError) SQLState() string {
 	return e.code
 }
+
+func TestDaemonObserver_BatchProcessed_Success(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 0}
+	storeStub := &stubProjectorStore{
+		events: []store.PersistedEvent{
+			{EventID: uuid.New(), GlobalPosition: 1, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 2, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 3, StreamType: "order"},
+		},
+	}
+	observer := &recordingObserver{}
+	daemon := &Daemon{
+		id:     instanceID,
+		db:     openStubDB(t, state),
+		store:  storeStub,
+		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
+	}
+
+	result, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	if err != nil {
+		t.Fatalf("processBatch() error = %v", err)
+	}
+	if !result.progressed {
+		t.Fatal("processBatch() progressed = false, want true")
+	}
+
+	if len(observer.batches) != 1 {
+		t.Fatalf("observer batches count = %d, want 1", len(observer.batches))
+	}
+	stats := observer.batches[0]
+	if stats.ProjectionName != "orders" {
+		t.Fatalf("ProjectionName = %q, want %q", stats.ProjectionName, "orders")
+	}
+	if stats.StartPosition != 0 {
+		t.Fatalf("StartPosition = %d, want 0", stats.StartPosition)
+	}
+	if stats.LastPosition != 3 {
+		t.Fatalf("LastPosition = %d, want 3", stats.LastPosition)
+	}
+	if stats.HeadPosition != 3 {
+		t.Fatalf("HeadPosition = %d, want 3", stats.HeadPosition)
+	}
+	if stats.Lag != 0 {
+		t.Fatalf("Lag = %d, want 0", stats.Lag)
+	}
+	if stats.EventsRead != 3 {
+		t.Fatalf("EventsRead = %d, want 3", stats.EventsRead)
+	}
+	if stats.EventsHandled != 3 {
+		t.Fatalf("EventsHandled = %d, want 3", stats.EventsHandled)
+	}
+	if stats.Duration <= 0 {
+		t.Fatalf("Duration = %v, want > 0", stats.Duration)
+	}
+	if stats.StaleSkipped {
+		t.Fatal("StaleSkipped = true, want false")
+	}
+	if stats.Error != nil {
+		t.Fatalf("Error = %v, want nil", stats.Error)
+	}
+}
+
+func TestDaemonObserver_BatchProcessed_FilteredProjections(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 0}
+	storeStub := &stubProjectorStore{
+		events: []store.PersistedEvent{
+			{EventID: uuid.New(), GlobalPosition: 1, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 2, StreamType: "user"},
+			{EventID: uuid.New(), GlobalPosition: 3, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 4, StreamType: "invoice"},
+		},
+	}
+	observer := &recordingObserver{}
+	inner := &recordingProjection{name: "orders"}
+	filtered := FilterStreamTypes(inner, "order")
+	daemon := &Daemon{
+		id:     instanceID,
+		db:     openStubDB(t, state),
+		store:  storeStub,
+		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
+	}
+
+	result, err := daemon.processBatch(context.Background(), filtered, 0)
+	if err != nil {
+		t.Fatalf("processBatch() error = %v", err)
+	}
+	if !result.progressed {
+		t.Fatal("processBatch() progressed = false, want true")
+	}
+
+	if len(observer.batches) != 1 {
+		t.Fatalf("observer batches count = %d, want 1", len(observer.batches))
+	}
+	stats := observer.batches[0]
+	if stats.EventsRead != 4 {
+		t.Fatalf("EventsRead = %d, want 4", stats.EventsRead)
+	}
+	if stats.EventsHandled != 4 {
+		t.Fatalf("EventsHandled = %d, want 4 (all batch events scanned and handled)", stats.EventsHandled)
+	}
+	if len(inner.handled) != 2 {
+		t.Fatalf("inner handled = %d, want 2", len(inner.handled))
+	}
+	if stats.LastPosition != 4 {
+		t.Fatalf("LastPosition = %d, want 4", stats.LastPosition)
+	}
+}
+
+func TestDaemonObserver_BatchProcessed_HandlerError(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 0}
+	storeStub := &stubProjectorStore{
+		events: []store.PersistedEvent{
+			{EventID: uuid.New(), GlobalPosition: 1, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 2, StreamType: "order"},
+		},
+	}
+	observer := &recordingObserver{}
+	handlerErr := errors.New("handler failed")
+	proj := &recordingProjection{name: "orders", failAt: 2, handleErr: handlerErr}
+	daemon := &Daemon{
+		id:     instanceID,
+		db:     openStubDB(t, state),
+		store:  storeStub,
+		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
+	}
+
+	_, err := daemon.processBatch(context.Background(), proj, 0)
+	if err == nil {
+		t.Fatal("processBatch() error = nil, want handler error")
+	}
+
+	if len(observer.batches) != 1 {
+		t.Fatalf("observer batches count = %d, want 1", len(observer.batches))
+	}
+	stats := observer.batches[0]
+	if stats.Error == nil {
+		t.Fatal("stats.Error = nil, want non-nil error")
+	}
+	if !strings.Contains(stats.Error.Error(), "handler failed") {
+		t.Fatalf("stats.Error = %v, want substring 'handler failed'", stats.Error)
+	}
+	if stats.StartPosition != 0 {
+		t.Fatalf("StartPosition = %d, want 0", stats.StartPosition)
+	}
+	if stats.LastPosition != 0 {
+		t.Fatalf("LastPosition = %d, want 0 (checkpoint not advanced)", stats.LastPosition)
+	}
+}
+
+func TestDaemonObserver_BatchProcessed_ProbeError(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 0}
+	storeStub := &stubProjectorStore{
+		readErr: errors.New("read events failed"),
+	}
+	observer := &recordingObserver{}
+	daemon := &Daemon{
+		id:     instanceID,
+		db:     openStubDB(t, state),
+		store:  storeStub,
+		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
+	}
+
+	_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	if err == nil {
+		t.Fatal("processBatch() error = nil, want read error")
+	}
+
+	if len(observer.batches) != 1 {
+		t.Fatalf("observer batches count = %d, want 1", len(observer.batches))
+	}
+	stats := observer.batches[0]
+	if stats.Error == nil {
+		t.Fatal("stats.Error = nil, want non-nil error")
+	}
+	if !strings.Contains(stats.Error.Error(), "read events failed") {
+		t.Fatalf("stats.Error = %v, want substring 'read events failed'", stats.Error)
+	}
+}
+
+func TestDaemonObserver_BatchProcessed_CommitError(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{
+		ownerID:    instanceID.String(),
+		ownerValid: true,
+		commitErr:  errors.New("commit conflict"),
+	}
+	storeStub := &stubProjectorStore{
+		events: []store.PersistedEvent{
+			{EventID: uuid.New(), GlobalPosition: 1, StreamType: "order"},
+		},
+	}
+	observer := &recordingObserver{}
+	daemon := &Daemon{
+		id:     instanceID,
+		db:     openStubDB(t, state),
+		store:  storeStub,
+		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
+	}
+
+	_, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	if err == nil {
+		t.Fatal("processBatch() error = nil, want commit error")
+	}
+
+	if len(observer.batches) != 1 {
+		t.Fatalf("observer batches count = %d, want 1", len(observer.batches))
+	}
+	stats := observer.batches[0]
+	if stats.Error == nil {
+		t.Fatal("stats.Error = nil, want non-nil error")
+	}
+	if !strings.Contains(stats.Error.Error(), "commit conflict") {
+		t.Fatalf("stats.Error = %v, want substring 'commit conflict'", stats.Error)
+	}
+}
+
+func TestDaemonObserver_GapDetected(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 0}
+	storeStub := &stubProjectorStore{
+		events: []store.PersistedEvent{
+			{EventID: uuid.New(), GlobalPosition: 2, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 3, StreamType: "order"},
+		},
+	}
+	observer := &recordingObserver{}
+	daemon := &Daemon{
+		id:     instanceID,
+		db:     openStubDB(t, state),
+		store:  storeStub,
+		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: observer},
+	}
+
+	gap := &gapState{}
+	result, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	if err != nil {
+		t.Fatalf("processBatchWithGapState() error = %v", err)
+	}
+	if !result.blockedByGap {
+		t.Fatal("blockedByGap = false, want true")
+	}
+
+	if len(observer.gaps) != 1 {
+		t.Fatalf("observer gaps count = %d, want 1", len(observer.gaps))
+	}
+	gapStats := observer.gaps[0]
+	if gapStats.ProjectionName != "orders" {
+		t.Fatalf("ProjectionName = %q, want %q", gapStats.ProjectionName, "orders")
+	}
+	if gapStats.GapPosition != 1 {
+		t.Fatalf("GapPosition = %d, want 1", gapStats.GapPosition)
+	}
+	if gapStats.HighestVisible != 3 {
+		t.Fatalf("HighestVisible = %d, want 3", gapStats.HighestVisible)
+	}
+}
+
+func TestDaemonObserver_GapSkipped(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 0}
+	storeStub := &stubProjectorStore{
+		events: []store.PersistedEvent{
+			{EventID: uuid.New(), GlobalPosition: 2, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 3, StreamType: "order"},
+			{EventID: uuid.New(), GlobalPosition: 4, StreamType: "order"},
+		},
+	}
+	observer := &recordingObserver{}
+	daemon := &Daemon{
+		id:    instanceID,
+		db:    openStubDB(t, state),
+		store: storeStub,
+		config: Config{
+			BatchSize:         10,
+			StaleGapThreshold: 10 * time.Millisecond,
+			StaleGapHarborLag: 0,
+			Logger:            store.NoOpLogger{},
+			Observer:          observer,
+		},
+	}
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	timeNow = func() time.Time { return base }
+	defer func() { timeNow = time.Now }()
+
+	gap := &gapState{}
+	_, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	if err != nil {
+		t.Fatalf("first batch error = %v", err)
+	}
+
+	// Advance time past StaleGapThreshold
+	timeNow = func() time.Time { return base.Add(50 * time.Millisecond) }
+
+	result, err := daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	if err != nil {
+		t.Fatalf("second batch error = %v", err)
+	}
+	if !result.staleSkipped {
+		t.Fatal("staleSkipped = false, want true")
+	}
+
+	if len(observer.skipped) != 1 {
+		t.Fatalf("observer skipped count = %d, want 1", len(observer.skipped))
+	}
+	skipped := observer.skipped[0]
+	if skipped.ProjectionName != "orders" {
+		t.Fatalf("ProjectionName = %q, want %q", skipped.ProjectionName, "orders")
+	}
+	if skipped.GapPosition != 1 {
+		t.Fatalf("GapPosition = %d, want 1", skipped.GapPosition)
+	}
+
+	if len(observer.batches) != 1 {
+		t.Fatalf("observer batches count = %d, want 1", len(observer.batches))
+	}
+	if !observer.batches[0].StaleSkipped {
+		t.Fatal("batch stats StaleSkipped = false, want true")
+	}
+}
+
+func TestDaemonObserver_Heartbeat(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true}
+	observer := &recordingObserver{}
+	daemon := &Daemon{
+		id: instanceID,
+		db: openStubDB(t, state),
+		config: Config{
+			HeartbeatInterval: 10 * time.Millisecond,
+			Logger:            store.NoOpLogger{},
+			Observer:          observer,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go daemon.runHeartbeatLoop(ctx)
+
+	// Wait for at least one heartbeat
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var heartbeats []DaemonStats
+	for {
+		heartbeats = observer.Heartbeats()
+		if len(heartbeats) > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	if len(heartbeats) == 0 {
+		t.Fatal("no heartbeats observed")
+	}
+	hb := heartbeats[0]
+	if hb.InstanceID != instanceID {
+		t.Fatalf("InstanceID = %v, want %v", hb.InstanceID, instanceID)
+	}
+	if hb.IsLeader {
+		t.Fatal("IsLeader = true, want false")
+	}
+}
+
+func TestDaemonObserver_Rebalance(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{
+		ownerID:    instanceID.String(),
+		ownerValid: true,
+		queryValues: []any{
+			// ListLiveInstances
+			instanceID.String(),
+			// GetAssignments
+			"p1",
+		},
+	}
+	observer := &recordingObserver{}
+	daemon := &Daemon{
+		id: instanceID,
+		db: openStubDB(t, state),
+		config: Config{
+			Logger:   store.NoOpLogger{},
+			Observer: observer,
+		},
+	}
+
+	tx, err := daemon.db.BeginTx(context.Background(), pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	conn := &pgxpool.Conn{}
+	_ = conn
+	_ = tx
+
+	assignments := map[string]uuid.UUID{"p1": instanceID}
+	if daemon.config.Observer != nil {
+		daemon.config.Observer.OnRebalance(context.Background(), assignments)
+	}
+
+	if len(observer.rebalances) != 1 {
+		t.Fatalf("rebalances count = %d, want 1", len(observer.rebalances))
+	}
+	if observer.rebalances[0]["p1"] != instanceID {
+		t.Fatalf("rebalance p1 = %v, want %v", observer.rebalances[0]["p1"], instanceID)
+	}
+}
+
+func TestDaemonObserver_NilObserver_Safety(t *testing.T) {
+	instanceID := uuid.New()
+	state := &stubDBState{ownerID: instanceID.String(), ownerValid: true, checkpointPos: 0}
+	storeStub := &stubProjectorStore{
+		events: []store.PersistedEvent{
+			{EventID: uuid.New(), GlobalPosition: 1, StreamType: "order"},
+		},
+	}
+	daemon := &Daemon{
+		id:     instanceID,
+		db:     openStubDB(t, state),
+		store:  storeStub,
+		config: Config{BatchSize: 10, Logger: store.NoOpLogger{}, Observer: nil},
+	}
+
+	// Should not panic on batch processing
+	result, err := daemon.processBatch(context.Background(), &recordingProjection{name: "orders"}, 0)
+	if err != nil {
+		t.Fatalf("processBatch() error = %v", err)
+	}
+	if !result.progressed {
+		t.Fatal("progressed = false, want true")
+	}
+
+	// Should not panic on gap
+	storeStub.events = []store.PersistedEvent{
+		{EventID: uuid.New(), GlobalPosition: 5, StreamType: "order"},
+	}
+	gap := &gapState{}
+	_, err = daemon.processBatchWithGapState(context.Background(), &recordingProjection{name: "orders"}, gap, 0)
+	if err != nil {
+		t.Fatalf("processBatchWithGapState() error = %v", err)
+	}
+}
