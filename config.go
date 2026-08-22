@@ -50,6 +50,7 @@ type Config struct { //nolint:govet // fieldalignment: readability over marginal
 	RebalanceInterval          time.Duration
 	BatchPause                 time.Duration
 	BatchTimeout               time.Duration
+	ShutdownTimeout            time.Duration
 	StaleGapThreshold          time.Duration
 	StaleGapHarborLag          int
 	Observer                   Observer
@@ -72,6 +73,7 @@ func DefaultConfig() Config {
 		RebalanceInterval:          5 * time.Second,
 		BatchPause:                 200 * time.Millisecond,
 		BatchTimeout:               30 * time.Second,
+		ShutdownTimeout:            5 * time.Second,
 		StaleGapThreshold:          30 * time.Second,
 		Logger:                     store.NoOpLogger{},
 		ProjectorInstancesTable:    postgres.DefaultProjectorInstancesTable,
@@ -151,6 +153,13 @@ func WithBatchPause(d time.Duration) Option {
 func WithBatchTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		c.BatchTimeout = d
+	}
+}
+
+// WithShutdownTimeout sets the maximum duration to wait for graceful daemon shutdown.
+func WithShutdownTimeout(d time.Duration) Option {
+	return func(c *Config) {
+		c.ShutdownTimeout = d
 	}
 }
 

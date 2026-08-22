@@ -2464,3 +2464,78 @@ func TestDaemonObserver_NilObserver_Safety(t *testing.T) {
 		t.Fatalf("processBatchWithGapState() error = %v", err)
 	}
 }
+
+func TestDaemon_IsRunning(t *testing.T) {
+	d := &Daemon{}
+
+	if d.IsRunning() {
+		t.Fatal("IsRunning() = true initially, want false")
+	}
+
+	d.mu.Lock()
+	d.started = true
+	d.mu.Unlock()
+
+	if !d.IsRunning() {
+		t.Fatal("IsRunning() = false when started, want true")
+	}
+
+	d.mu.Lock()
+	d.started = false
+	d.mu.Unlock()
+
+	if d.IsRunning() {
+		t.Fatal("IsRunning() = true when stopped, want false")
+	}
+}
+
+func TestDaemon_IsLeader(t *testing.T) {
+	d := &Daemon{}
+
+	if d.IsLeader() {
+		t.Fatal("IsLeader() = true initially, want false")
+	}
+
+	d.setLeader(true)
+	if !d.IsLeader() {
+		t.Fatal("IsLeader() = false after setLeader(true), want true")
+	}
+
+	d.setLeader(false)
+	if d.IsLeader() {
+		t.Fatal("IsLeader() = true after setLeader(false), want false")
+	}
+}
+
+func TestDaemon_ShutdownTimeout(t *testing.T) {
+	dDefault := &Daemon{config: Config{}}
+	if got := dDefault.shutdownTimeout(); got != defaultShutdownTimeout {
+		t.Fatalf("shutdownTimeout() = %v, want default %v", got, defaultShutdownTimeout)
+	}
+
+	dCustom := &Daemon{config: Config{ShutdownTimeout: 15 * time.Second}}
+	if got := dCustom.shutdownTimeout(); got != 15*time.Second {
+		t.Fatalf("shutdownTimeout() = %v, want %v", got, 15*time.Second)
+	}
+}
+
+func TestDaemon_Start_CanceledContextReturnsNil(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context
+
+	state := &stubDBState{
+		execErr: context.Canceled,
+	}
+
+	d := New(
+		openStubDB(t, state),
+		&stubProjectorStore{},
+		[]Projection{&recordingProjection{name: "orders"}},
+		WithLogger(store.NoOpLogger{}),
+	)
+
+	err := d.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start(canceledContext) returned non-nil error: %v, want nil", err)
+	}
+}
