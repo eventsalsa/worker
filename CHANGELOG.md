@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/eventsalsa/projector/compare/v0.2.0...v0.3.0) (2026-08-22)
+
+
+### Features
+
+* **observer:** introduce pluggable telemetry and lifecycle observer ([7dd0852](https://github.com/eventsalsa/projector/commit/7dd08526b389d56e08f729777e5d7cc93cfc8a28))
+
 ## [0.2.0](https://github.com/eventsalsa/projector/compare/v0.1.0...v0.2.0) (2026-08-21)
 
 
