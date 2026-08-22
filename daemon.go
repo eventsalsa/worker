@@ -398,6 +398,12 @@ func (d *Daemon) runHeartbeatLoop(ctx context.Context) {
 			}
 
 			missingRegistrationCount = 0
+			if d.config.Observer != nil {
+				d.config.Observer.OnHeartbeat(ctx, DaemonStats{
+					InstanceID: d.id,
+					IsLeader:   d.leaderActive(),
+				})
+			}
 		}
 	}
 }
@@ -563,6 +569,9 @@ func (d *Daemon) rebalance(ctx context.Context, conn *pgxpool.Conn) error {
 	committed = true
 
 	d.logger().Info(ctx, "projection assignments updated", "instance_id", d.id, "live_instances", len(liveInstances), "projections", len(projectionNames))
+	if d.config.Observer != nil {
+		d.config.Observer.OnRebalance(ctx, nextAssignments)
+	}
 	return nil
 }
 
@@ -776,13 +785,13 @@ func (d *Daemon) processBatch(
 	return d.processBatchWithGapState(parentCtx, registeredProjection, &gapState{}, checkpointOverride...)
 }
 
-//nolint:gocyclo // sequential batch processing steps
 func (d *Daemon) processBatchWithGapState(
 	parentCtx context.Context,
 	registeredProjection Projection,
 	gapTracker *gapState,
 	checkpointOverride ...int64,
 ) (processedBatch, error) {
+	start := timeNow()
 	ctx := parentCtx
 	if d.config.BatchTimeout > 0 {
 		var cancel context.CancelFunc
@@ -792,6 +801,13 @@ func (d *Daemon) processBatchWithGapState(
 
 	probe, err := d.probeFrontier(ctx, registeredProjection.Name(), gapTracker, checkpointOverride...)
 	if err != nil {
+		if d.config.Observer != nil {
+			d.config.Observer.OnBatchProcessed(ctx, BatchStats{
+				ProjectionName: registeredProjection.Name(),
+				Duration:       timeNow().Sub(start),
+				Error:          err,
+			})
+		}
 		return processedBatch{}, err
 	}
 
@@ -807,7 +823,27 @@ func (d *Daemon) processBatchWithGapState(
 	}
 
 	result, err := d.processProbedBatch(ctx, registeredProjection, &probe)
+	duration := timeNow().Sub(start)
 	if err != nil {
+		if d.config.Observer != nil {
+			lastPos := probe.checkpoint
+			lag := probe.highestVisible - lastPos
+			if lag < 0 {
+				lag = 0
+			}
+			d.config.Observer.OnBatchProcessed(ctx, BatchStats{
+				ProjectionName: registeredProjection.Name(),
+				StartPosition:  probe.checkpoint,
+				LastPosition:   lastPos,
+				HeadPosition:   probe.highestVisible,
+				Lag:            lag,
+				EventsRead:     len(probe.rows),
+				EventsHandled:  0,
+				Duration:       duration,
+				StaleSkipped:   probe.staleSkipped,
+				Error:          err,
+			})
+		}
 		return processedBatch{}, err
 	}
 
@@ -823,6 +859,34 @@ func (d *Daemon) processBatchWithGapState(
 			"handled_events", result.handledCount,
 			"visible_head", probe.highestVisible,
 		)
+		if d.config.Observer != nil {
+			d.config.Observer.OnGapSkipped(ctx, GapStats{
+				ProjectionName: registeredProjection.Name(),
+				GapPosition:    probe.gapPosition,
+				HighestVisible: probe.highestVisible,
+				StaleFor:       timeNow().Sub(probe.firstSeenAt),
+			})
+		}
+	}
+
+	if d.config.Observer != nil {
+		lastPos := result.checkpoint
+		lag := probe.highestVisible - lastPos
+		if lag < 0 {
+			lag = 0
+		}
+		d.config.Observer.OnBatchProcessed(ctx, BatchStats{
+			ProjectionName: registeredProjection.Name(),
+			StartPosition:  probe.checkpoint,
+			LastPosition:   lastPos,
+			HeadPosition:   probe.highestVisible,
+			Lag:            lag,
+			EventsRead:     len(probe.rows),
+			EventsHandled:  result.handledCount,
+			Duration:       duration,
+			StaleSkipped:   result.staleSkipped,
+			Error:          nil,
+		})
 	}
 
 	if result.progressed {
@@ -869,6 +933,14 @@ func (d *Daemon) probeFrontier(
 	}
 	staleFor := gapTracker.observe(probe.gapPosition, probe.highestVisible, timeNow())
 	probe.firstSeenAt = gapTracker.firstSeenAt
+	if d.config.Observer != nil {
+		d.config.Observer.OnGapDetected(ctx, GapStats{
+			ProjectionName: projectionName,
+			GapPosition:    probe.gapPosition,
+			HighestVisible: probe.highestVisible,
+			StaleFor:       staleFor,
+		})
+	}
 	if staleFor < d.staleGapThreshold() {
 		return probe, nil
 	}
@@ -973,7 +1045,8 @@ func (d *Daemon) processProbedBatchAttempt(
 		return prepared, nil
 	}
 
-	if err := handleRelevantEvents(ctx, tx, registeredProjection, probe.rows, probe.targetCheckpoint); err != nil {
+	handledCount, err := handleRelevantEvents(ctx, tx, registeredProjection, probe.rows, probe.targetCheckpoint)
+	if err != nil {
 		return processedBatch{}, err
 	}
 
@@ -994,7 +1067,7 @@ func (d *Daemon) processProbedBatchAttempt(
 		progressed:   true,
 		fullWindow:   probe.fullWindow,
 		checkpoint:   probe.targetCheckpoint,
-		handledCount: len(probe.rows),
+		handledCount: handledCount,
 		staleSkipped: probe.staleSkipped,
 	}, nil
 }
@@ -1085,17 +1158,19 @@ func handleRelevantEvents(
 	registeredProjection Projection,
 	events []store.PersistedEvent,
 	upperBound int64,
-) error {
+) (int, error) {
+	handled := 0
 	for i := range events {
 		if events[i].GlobalPosition > upperBound {
 			break
 		}
 		if err := registeredProjection.Handle(ctx, tx, events[i]); err != nil {
-			return fmt.Errorf("handle event %s for projection %s: %w", events[i].EventID, registeredProjection.Name(), err)
+			return handled, fmt.Errorf("handle event %s for projection %s: %w", events[i].EventID, registeredProjection.Name(), err)
 		}
+		handled++
 	}
 
-	return nil
+	return handled, nil
 }
 
 func buildFrontierProbe(checkpoint int64, rows []store.PersistedEvent, batchSize int) frontierProbe {

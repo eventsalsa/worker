@@ -29,7 +29,7 @@ const (
 )
 
 // Config holds all configurable values for a Daemon.
-type Config struct {
+type Config struct { //nolint:govet // fieldalignment: readability over marginal memory savings
 	Logger                     store.Logger
 	ProjectorInstancesTable    string
 	ProjectionAssignmentsTable string
@@ -52,6 +52,7 @@ type Config struct {
 	BatchTimeout               time.Duration
 	StaleGapThreshold          time.Duration
 	StaleGapHarborLag          int
+	Observer                   Observer
 }
 
 // Option configures a Daemon.
@@ -246,5 +247,12 @@ func WithLeaderStrategy(strategy LeaderStrategy) Option {
 func WithProjectorLeaderLeasesTable(name string) Option {
 	return func(c *Config) {
 		c.ProjectorLeaderLeasesTable = name
+	}
+}
+
+// WithObserver sets the telemetry and lifecycle observer for the daemon.
+func WithObserver(observer Observer) Option {
+	return func(c *Config) {
+		c.Observer = observer
 	}
 }

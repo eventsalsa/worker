@@ -18,6 +18,7 @@ It builds on [`github.com/eventsalsa/store`](https://github.com/eventsalsa/store
   - polling via periodic latest-position checks
   - PostgreSQL `LISTEN`/`NOTIFY` with reconciliation polling fallback
 - **Stream and event filtering decorators** (`FilterStreamTypes`, `FilterEventTypes`)
+- **Pluggable telemetry and metrics observer** for monitoring projection lag, batch duration, throughput, gap skips, and rebalances with zero extra database queries
 - **Migration generation** for projector infrastructure tables
 - **Customizable configuration** via the functional options pattern
 
@@ -198,6 +199,7 @@ daemon := projector.New(db, eventStore, projections,
 | `WithNotifyConnectionString(connStr string)` | PostgreSQL connection string used by the notify dispatcher | empty |
 | `WithNotifyChannel(channel string)` | PostgreSQL notification channel for the notify dispatcher | empty (`""`) |
 | `WithLeaderStrategy(strategy)` | Leader election strategy: `projector.LeaderStrategyAdvisory` or `projector.LeaderStrategyLease` | `projector.LeaderStrategyAdvisory` |
+| `WithObserver(observer Observer)` | Telemetry and lifecycle observer | `nil` |
 
 ### Leader election strategies
 
@@ -394,6 +396,89 @@ Each instance will:
 This makes scaling operationally simple: add more projector daemon processes and let PostgreSQL-backed assignment rebalancing distribute the projections.
 
 On startup, an instance may also prune `projector_instances` rows whose heartbeats are older than twice the configured heartbeat timeout. That cleanup is best-effort and intentionally more conservative than rebalance liveness detection. If an instance ever loses its own registration row later, it shuts down instead of continuing to run invisibly.
+
+## Observability and telemetry
+
+The projector daemon exposes internal runtime events and metrics via a pluggable `Observer` interface without executing any extra out-of-band database polling queries:
+
+```go
+type Observer interface {
+    OnBatchProcessed(ctx context.Context, stats BatchStats)
+    OnHeartbeat(ctx context.Context, stats DaemonStats)
+    OnGapDetected(ctx context.Context, stats GapStats)
+    OnGapSkipped(ctx context.Context, stats GapStats)
+    OnRebalance(ctx context.Context, assignments map[string]uuid.UUID)
+}
+```
+
+### Telemetry data structures
+
+- **`BatchStats`**: contains batch execution latency (`Duration`), global checkpoint positions (`StartPosition`, `LastPosition`, `HeadPosition`), calculated event lag (`Lag = max(0, HeadPosition - LastPosition)`), throughput counts (`EventsRead`, `EventsHandled`), safe-harbor stale skip indicator (`StaleSkipped`), and error status (`Error`).
+- **`DaemonStats`**: contains instance UUID (`InstanceID`) and leadership status (`IsLeader`).
+- **`GapStats`**: contains missing sequence coordinate (`GapPosition`), visible stream head (`HighestVisible`), and elapsed duration (`StaleFor`).
+
+### Convenience utilities
+
+- **`NoopObserver`**: empty struct implementing all `Observer` methods. Embed it into your struct to implement only the callbacks you need.
+- **`MultiObserver(observers ...Observer) Observer`**: combines multiple observers (e.g. Prometheus + OpenTelemetry + structured logger) into a single composite listener, automatically stripping `nil` entries and flattening nested multi-observers.
+
+### Prometheus metrics recipe
+
+```go
+package main
+
+import (
+    "context"
+
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+
+    "github.com/eventsalsa/projector"
+)
+
+type PrometheusObserver struct {
+    projector.NoopObserver
+    batchDuration *prometheus.HistogramVec
+    lagGauge      *prometheus.GaugeVec
+    eventsHandled *prometheus.CounterVec
+    checkpointPos *prometheus.GaugeVec
+}
+
+func NewPrometheusObserver() *PrometheusObserver {
+    return &PrometheusObserver{
+        batchDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+            Name: "projector_batch_duration_seconds",
+            Help: "Duration of projection batch processing in seconds.",
+        }, []string{"projection", "status"}),
+        lagGauge: promauto.NewGaugeVec(prometheus.GaugeOpts{
+            Name: "projector_lag_events",
+            Help: "Current projection lag in global events behind event store head.",
+        }, []string{"projection"}),
+        checkpointPos: promauto.NewGaugeVec(prometheus.GaugeOpts{
+            Name: "projector_checkpoint_position",
+            Help: "Current global checkpoint position reached by projection.",
+        }, []string{"projection"}),
+        eventsHandled: promauto.NewCounterVec(prometheus.CounterOpts{
+            Name: "projector_events_handled_total",
+            Help: "Total number of events handled by projection.",
+        }, []string{"projection"}),
+    }
+}
+
+func (p *PrometheusObserver) OnBatchProcessed(_ context.Context, stats projector.BatchStats) {
+    status := "success"
+    if stats.Error != nil {
+        status = "error"
+    }
+
+    p.batchDuration.WithLabelValues(stats.ProjectionName, status).Observe(stats.Duration.Seconds())
+    p.lagGauge.WithLabelValues(stats.ProjectionName).Set(float64(stats.Lag))
+    p.checkpointPos.WithLabelValues(stats.ProjectionName).Set(float64(stats.LastPosition))
+    p.eventsHandled.WithLabelValues(stats.ProjectionName).Add(float64(stats.EventsHandled))
+}
+```
+
+See [`examples/telemetry/main.go`](examples/telemetry/main.go) for a complete runnable sample.
 
 ## Development
 
