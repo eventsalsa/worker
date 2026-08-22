@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/eventsalsa/projector/compare/v0.3.0...v0.4.0) (2026-08-22)
+
+
+### Features
+
+* **daemon:** refine lifecycle and coordination for errgroup compatibility ([8ffb003](https://github.com/eventsalsa/projector/commit/8ffb003ce1978d6f342020b7f64a5322b9cfa2fd))
+
 ## [0.3.0](https://github.com/eventsalsa/projector/compare/v0.2.0...v0.3.0) (2026-08-22)
 
 
